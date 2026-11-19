@@ -204,7 +204,9 @@ def upload_file(port_api : int, uid : int, file_b64, file_name : str, file_curso
             oss_store.safe_remove(stage_path)
 
     if oss_enabled and need_blob:
-        if oss_store.upload_file_to_oss(port_api, disk_path, "file", hashes):
+        if oss_store.upload_file_to_oss(
+            port_api, disk_path, "file", hashes, content_type=file_type
+        ):
             oss_store.safe_remove(disk_path)
     elif oss_enabled and os.path.isfile(disk_path):
         oss_store.safe_remove(disk_path)
@@ -270,7 +272,9 @@ def upload_sticker(port_api : int, uid : int, file_b64, file_name : str, sticker
             oss_store.safe_remove(stage_path)
 
     if oss_enabled and need_blob:
-        if oss_store.upload_file_to_oss(port_api, disk_path, "sticker", hashes):
+        if oss_store.upload_file_to_oss(
+            port_api, disk_path, "sticker", hashes, content_type=file_type
+        ):
             oss_store.safe_remove(disk_path)
     elif oss_enabled and os.path.isfile(disk_path):
         oss_store.safe_remove(disk_path)
@@ -578,7 +582,9 @@ def _finalize_chunked_upload(port_api : int, uid : int, file_name : str, file_id
             oss_store.safe_remove(combined)
 
         if oss_enabled and need_blob:
-            if oss_store.upload_file_to_oss(port_api, final_path, "file", file_hash):
+            if oss_store.upload_file_to_oss(
+                port_api, final_path, "file", file_hash, content_type=file_type
+            ):
                 oss_store.safe_remove(final_path)
 
         if media_enabled:
@@ -920,7 +926,9 @@ def _process_media(port_api : int, hashes : str, file_cursor : FileDb):
 
     if thumb_bytes and oss_enabled:
         path = thumb_path(port_api, hashes)
-        if oss_store.upload_file_to_oss(port_api, path, "thumb", hashes):
+        if oss_store.upload_file_to_oss(
+            port_api, path, "thumb", hashes, content_type="image/webp"
+        ):
             oss_store.safe_remove(path)
 
     notifier = _media_notifier

@@ -21,7 +21,12 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 
 新版本支持 重定向下载。
 
-当服务器启用 OSS2 对象存储且 `file_download_mode` 为 `redirect`（默认值）时，该接口返回 `307 Temporary Redirect`，`Location` 指向 OSS2 的预签名直链，客户端应跟随重定向直接从对象存储下载（字节不再经过 TFV5 服务器）。预签名直链有效期 15 分钟，且已携带与代理下载一致的 `Content-Disposition`（含原始文件名，中文等非 ASCII 文件名使用 RFC 5987 编码）与 `Content-Type`。
+当服务器启用 OSS2 对象存储且 `file_download_mode` 为 `redirect`（默认值）时，该接口返回 `307 Temporary Redirect`，`Location` 指向 OSS2 的预签名直链，客户端应跟随重定向直接从对象存储下载（字节不再经过 TFV5 服务器）。预签名直链有效期 15 分钟，且已携带与代理下载一致的 `Content-Disposition`（含原始文件名，中文等非 ASCII 文件名使用 RFC 5987 编码）。
+
+关于重定向直链的限制：
+
+- 直链域名取**公网** endpoint，且使用 `https`。
+- 直链**不带** `response-content-type` 覆盖。
 
 重定向模式的已知差异：
 
@@ -335,6 +340,10 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 - `media_features`：媒体元数据与缩略图开关（布尔，默认 `true`）。关闭后新上传不再生成、已有缩略图/blurhash 继续下发；重新打开后由惰性自愈逐步补齐缺口。
 
 此外 `file_last_time` 控制引用计数为 0 且超时的文件自动清理（单位：小时）。
+
+OSS2 相关参数不在管理接口内，需写在 `res/<port>/config.json`：`storage_backend`、`oss2_authid`、`oss2_authkey`、`oss2_endpoint`、`oss2_bucket`。可选 `oss2_public_endpoint` 指定预签名直链使用的公网域名（含或不含 `http(s)://` 均可，不带协议时按 `https` 处理）
+
+不配置时由 `oss2_endpoint` 去掉 `-internal` 自动推导，因此常规内网 endpoint（`oss-cn-xxx-internal.aliyuncs.com`）无需额外配置。若 `oss2_endpoint` 是自定义 CNAME 且仅内网可达，则必须显式配置 `oss2_public_endpoint`。
 
 ## 媒体元数据与缩略图
 

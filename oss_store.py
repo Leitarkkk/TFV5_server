@@ -64,11 +64,72 @@ def is_oss_enabled(port_api: int, cfg: dict = None) -> bool:
                 and cfg.get("oss2_endpoint") and cfg.get("oss2_bucket"))
 
 
+_DEFAULT_ENDPOINT_SCHEME = "https://"
+
+
+def _normalize_endpoint(endpoint) -> str:
+    """补全 scheme、去掉尾部斜杠。
+
+    不带 scheme 时统一补 https：预签名 URL 是直接下发到浏览器的，http 会在
+    https 页面上被当混合内容拦掉。
+    """
+    if not isinstance(endpoint, str):
+        return ""
+    value = endpoint.strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = _DEFAULT_ENDPOINT_SCHEME + value
+    return value
+
+
+def _endpoint_host(endpoint: str) -> str:
+    return endpoint.split("://", 1)[-1].rstrip("/") if endpoint else ""
+
+
+def internal_endpoint(cfg: dict) -> str:
+    """服务端自己读写 OSS 用的 endpoint（一般是 VPC 内网地址），保持配置原样。"""
+    value = cfg.get("oss2_endpoint")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def public_endpoint(cfg: dict) -> str:
+    """下发给客户端的预签名 URL 所用的 endpoint，必须是公网可达地址。
+
+    ``oss2_endpoint`` 常被配成 ``xxx-internal.aliyuncs.com`` 这类内网域名，
+    它只在阿里云 VPC 内可解析（公网解析到 100.64/10 段），外部客户端连不上。
+    优先读 ``oss2_public_endpoint``；未配置时从 ``oss2_endpoint`` 去掉
+    ``-internal`` 推导——这正是阿里云内网 endpoint 的公网对应形式。
+    """
+    configured = _normalize_endpoint(cfg.get("oss2_public_endpoint"))
+    if configured:
+        return configured
+    host = _endpoint_host(internal_endpoint(cfg)).replace("-internal.", ".")
+    if not host:
+        return ""
+    return _DEFAULT_ENDPOINT_SCHEME + host
+
+
 def _get_bucket(port_api: int, cfg: dict = None):
+    """内网 bucket：上传、下载、head、删除都走这里。"""
     if cfg is None:
         cfg = _read_config(port_api)
     auth = oss2.Auth(cfg["oss2_authid"], cfg["oss2_authkey"])
     return oss2.Bucket(auth, cfg["oss2_endpoint"], cfg["oss2_bucket"])
+
+
+def _get_sign_bucket(port_api: int, cfg: dict = None):
+    """仅用于生成预签名 URL：公网 endpoint。
+
+    OSS V1 签名只覆盖 path 与子资源、与 host 无关，所以用公网 endpoint 签出来的
+    地址可以直接给外部客户端使用，不需要额外改写 host。
+    """
+    if cfg is None:
+        cfg = _read_config(port_api)
+    auth = oss2.Auth(cfg["oss2_authid"], cfg["oss2_authkey"])
+    return oss2.Bucket(
+        auth, public_endpoint(cfg) or cfg["oss2_endpoint"], cfg["oss2_bucket"]
+    )
 
 
 def object_key(kind: str, hashes: str) -> str:
@@ -80,8 +141,21 @@ def object_key(kind: str, hashes: str) -> str:
     return "{}/{}.file".format(kind, hashes)
 
 
-def upload_file_to_oss(port_api: int, local_path: str, kind: str, hashes: str, cfg: dict = None) -> bool:
-    """将本地临时文件上传到 OSS2（上传完成后由调用方负责删除本地文件）。"""
+_KIND_DEFAULT_CONTENT_TYPE = {
+    "thumb": "image/webp",
+    "file": "application/octet-stream",
+    "sticker": "application/octet-stream",
+}
+
+
+def upload_file_to_oss(port_api: int, local_path: str, kind: str, hashes: str,
+                       cfg: dict = None, content_type: str = None) -> bool:
+    """将本地临时文件上传到 OSS2（上传完成后由调用方负责删除本地文件）。
+
+    [content_type] 会写进对象元数据。下载接口不再用预签名覆盖响应头，
+    所以这里的 Content-Type 就是客户端最终拿到的类型——图片、贴图要传准，
+    否则浏览器会把它当附件下载而不是内联显示。
+    """
     if not is_oss_enabled(port_api, cfg):
         return False
     if cfg is None:
@@ -90,8 +164,12 @@ def upload_file_to_oss(port_api: int, local_path: str, kind: str, hashes: str, c
         return False
     bucket = _get_bucket(port_api, cfg)
     key = object_key(kind, hashes)
+    headers = {}
+    resolved_type = content_type or _KIND_DEFAULT_CONTENT_TYPE.get(kind)
+    if resolved_type:
+        headers["Content-Type"] = resolved_type
     try:
-        bucket.put_object_from_file(key, local_path)
+        bucket.put_object_from_file(key, local_path, headers=headers or None)
         return True
     except Exception as e:
         print("[WARN] OSS2 上传失败 ({}): {}".format(key, e))
@@ -182,22 +260,29 @@ def _content_disposition_value(filename: str):
 
 
 def presigned_download_url(port_api: int, kind: str, hashes: str, filename: str = None,
-                           content_type: str = None, expires: int = 900,
-                           cfg: dict = None) -> str:
-    """生成 OSS2 预签名下载 URL！未启用 OSS、签名失败时返回空字符串。"""
+                           expires: int = 900, cfg: dict = None) -> str:
+    """生成 OSS2 预签名下载 URL。未启用 OSS、签名失败时返回空字符串。
+
+    两个硬约束，违反任意一条客户端都拿不到字节：
+
+    1. 必须用**公网** endpoint 签名（见 :func:`public_endpoint`）。内网域名在
+       公网解析到 100.64/10 段，请求会一直挂着直到超时。
+    2. **不能带** ``response-content-type``。OSS 对该参数直接返回
+       ``400 InvalidRequest: Can not override response header on content-type``
+       （EC 0017-00000902），连签名合法都没用。响应类型改由对象自身的
+       Content-Type 元数据决定，由 :func:`upload_file_to_oss` 在上传时写入。
+    """
     if not is_oss_enabled(port_api, cfg):
         return ""
     if cfg is None:
         cfg = _read_config(port_api)
-    bucket = _get_bucket(port_api, cfg)
+    bucket = _get_sign_bucket(port_api, cfg)
     key = object_key(kind, hashes)
     params = {}
     if filename:
         disposition = _content_disposition_value(filename)
         if disposition:
             params["response-content-disposition"] = disposition
-    if content_type:
-        params["response-content-type"] = content_type
     try:
         return bucket.sign_url("GET", key, expires, params=params or None, slash_safe=True)
     except Exception as e:

@@ -2107,6 +2107,32 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         return ret
 
+    @app.route("/auth/uids")
+    def query_uids():
+        """批量取用户公开信息
+        """
+        raw = flask_request.args.get("uids", "")
+        uids = []
+        for token in raw.split(","):
+            token = token.strip()
+            if token.isdigit() and len(uids) < 100:
+                uids.append(token)
+        ret = {}
+        for uid in uids:
+            info = user_cursor.uid_query(uid)
+            if not len(info):
+                continue
+            ret[uid] = {
+                "uid": info[0][0],
+                "username": info[0][1],
+                "email": info[0][2] if public_email_visible(info[0]) else "",
+                "stat": info[0][4],
+                "create_time": info[0][5],
+                "personal_sign": info[0][6],
+                "introduction": info[0][7]
+            }
+        return ret
+
     @app.route("/auth/username/<username>")
     def query_username(username):
         info = user_cursor.username_query(username)
@@ -5170,9 +5196,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         download_name = metadata.get("file_name") or hashes
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 不要传 content_type
+                # 类型由对象元数据决定
                 url = oss_store.presigned_download_url(
                     port_api, "file", hashes, download_name,
-                    content_type=mime_from_name(download_name),
                 )
                 if url:
                     return redirect(url, code=307)
@@ -5221,8 +5248,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         download_name = "{}.thumb.webp".format(hashes)
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 同上：不 response-content-type 覆盖
                 url = oss_store.presigned_download_url(
-                    port_api, "thumb", hashes, download_name, content_type="image/webp")
+                    port_api, "thumb", hashes, download_name)
                 if url:
                     return redirect(url, code=307)
             temp_path = oss_store.temp_download_path(port_api, "thumb", hashes)
@@ -5331,9 +5359,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 同上：不 response-content-type 覆盖
                 url = oss_store.presigned_download_url(
                     port_api, "sticker", hashes, download_name,
-                    content_type=mimetype_map.get(ext),
                 )
                 if url:
                     return redirect(url, code=307)
