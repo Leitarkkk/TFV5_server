@@ -902,6 +902,8 @@ class InstantConnect():
         try:
             while True:
                 message = await queue.get()
+                if self.send_queue.get(websocket) is not queue:
+                    return
                 await websocket.send(self.encrypt_response(message, websocket))
         except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
             pass
@@ -926,6 +928,7 @@ class InstantConnect():
             return
         
         expiry_task = None
+        send_task = None
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
             message = json.loads(message)
@@ -956,38 +959,43 @@ class InstantConnect():
                     verified_uid = login_uid if verified else None
             if verified_uid is None:
                 raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
+            queue = asyncio.Queue(maxsize=self.SEND_QUEUE_LIMIT)
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
-                became_online = not self.connected_clients.get(verified_uid)
-                if verified_uid not in self.connected_clients.keys():
-                    self.connected_clients[verified_uid] = []
-                self.connected_clients[verified_uid].append(websocket)
+                clients = self.connected_clients.setdefault(verified_uid, [])
+                became_online = not clients
                 self.clients_belonged[websocket] = verified_uid
                 self.clients_token[websocket] = verified_jti
                 self.clients_session[websocket] = verified_sid
+                self.send_queue[websocket] = queue
+                clients.append(websocket)
             # A password change can commit between credential validation and
             # registering this socket for disconnect_user(). Check again before
-            # allowing pushes or acknowledging the connection.
+            # acknowledging the connection or draining any buffered pushes.
             if await to_thread(self.user_cursor.get_auth_version, verified_uid) != auth_version:
                 raise ValueError("Credentials changed during login")
+            if self.send_queue.get(websocket) is not queue:
+                return
             if expires_at is not None:
                 expires_at = int(expires_at)
                 if expires_at <= time.time():
                     raise ValueError("Token expired")
                 expiry_task = asyncio.create_task(self._close_on_expiry(websocket, expires_at))
-            self.send_queue[websocket] = asyncio.Queue(maxsize=self.SEND_QUEUE_LIMIT)
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
-            if became_online:
+            if became_online and self.send_queue.get(websocket) is queue:
                 await to_thread(self._mark_online, verified_uid)
+            if self.send_queue.get(websocket) is not queue:
+                return
+            send_task = asyncio.create_task(self.sender(websocket, queue))
 
-        except Exception as e:
-            if expiry_task is not None:
-                expiry_task.cancel()
+        except Exception:
             print("[ERR] 客户端链接 WS 服务器后没有登录")
-            self._cleanup_client(websocket)
             return
-        
-        send_task = asyncio.create_task(self.sender(websocket, self.send_queue[websocket]))
+        finally:
+            if send_task is None:
+                if expiry_task is not None:
+                    expiry_task.cancel()
+                self._cleanup_client(websocket)
 
         try:
             async for message in websocket:
