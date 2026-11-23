@@ -1156,6 +1156,33 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         cleanup_forum_queue(target_uid)
         return True
 
+    STAT_BAN_REASON = "账号状态被管理员设为封禁"
+
+    def _ensure_stat_ban(uid, operator_uid):
+        if punishments_cursor is None:
+            return True, None
+        if punishments_cursor.active_ban(uid) is not None:
+            return True, None
+        punishment_id = punishments_cursor.create(
+            uid, "ban", STAT_BAN_REASON, operator_uid
+        )
+        if not punishment_id:
+            return False, None
+        return True, punishment_id
+
+    def _revoke_stat_ban(uid, operator_uid):
+        if punishments_cursor is None:
+            return
+        now = time.time()
+        for row in punishments_cursor.list_for_user(uid):
+            if row[2] != "ban" or row[3] != STAT_BAN_REASON:
+                continue
+            if row[7] is not None:
+                continue
+            if row[6] is not None and row[6] <= now:
+                continue
+            punishments_cursor.revoke(row[0], operator_uid)
+
     def perform_managed_auth_change(uid : int, pwd : str, target_uid : int, new_auth : str):
         operator = verify_manager(uid, pwd)
         if operator is None:
@@ -1165,8 +1192,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if target is None:
             return False
 
+        created_ban = None
+        if new_auth == "banned":
+            ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
+            if not ok:
+                return False
+
         if not user_cursor.update_user_with_root_guard(target_uid, stat=new_auth):
+            if created_ban:
+                punishments_cursor.revoke(created_ban, operator[0])
             return False
+        if new_auth != "banned":
+            _revoke_stat_ban(target_uid, operator[0])
 
         # 吊销全部 JWT；封禁时把人家的 WebSocket 全部使用尖头靴子踢掉
         user_cursor.bump_auth_version(target_uid)
@@ -1180,10 +1217,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
         return True
     
-    # ---- 外部认证平台（TouchFish Auth）专用准入 ----
-    # 该组端点只服务于服务端到服务端的调用：
-    #   IP/CIDR 白名单（remote_addr 已经过 ProxyFix）
-    #   + 可选共享令牌（防 X-Forwarded-For 伪造绕过白名单）
+    # 外部认证平台（TouchFish Auth）!!!!
+    # 由 YWD2023 强力驱动
     PLATFORM_PREFIX = "/auth/platform/"
 
     def platform_issuer(cfg=None):
@@ -1492,6 +1527,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         # 可以靠 refresh 一直续下去（默认 7 天），等于没封。
         if _active_ban(uid) is not None:
             return {"error": "account_banned"}
+        refresh_row = user_cursor.uid_query(uid)
+        if refresh_row and refresh_row[0][4] == "banned":
+            _sweep_legacy_ban(uid)
+            refresh_row = user_cursor.uid_query(uid)
+            if refresh_row and refresh_row[0][4] == "banned":
+                return {"error": "account_banned"}
         auth_version = user_cursor.get_auth_version(uid)
 
         new_refresh_token = secrets.token_hex(32)
@@ -1620,6 +1661,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not row:
             return {"error": "external_token_invalid"}
         if row[0][4] in _BLOCKED_STATS:
+            return {"error": "user_banned"}
+        if _content_block(uid, row[0][4]) == "account_banned":
             return {"error": "user_banned"}
         return create_session_for_user(
             uid, req.get("device_id"), req.get("device_name"), req.get("platform", 0)
@@ -2355,6 +2398,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 user_cursor.delete_user(target_uid)
                 return bool_res()[False]
 
+            if new_auth == "banned":
+                ok, _created = _ensure_stat_ban(target_uid, operator[0])
+                if not ok:
+                    user_cursor.delete_user(target_uid)
+                    return bool_res()[False]
+
             if not ensure_notification_table(target_uid):
                 user_cursor.delete_user(target_uid)
                 return bool_res()[False]
@@ -2392,8 +2441,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     or len(updates["password"]) < int(cfg.get("min_password_length", 1))):
                 return bool_res()[False]
 
+            created_ban = None
+            if next_auth == "banned":
+                ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
+                if not ok:
+                    return bool_res()[False]
+
             if not user_cursor.update_user_with_root_guard(target_uid, **updates):
+                if created_ban:
+                    punishments_cursor.revoke(created_ban, operator[0])
                 return bool_res()[False]
+            if next_auth is not None and next_auth != "banned":
+                _revoke_stat_ban(target_uid, operator[0])
 
             if "password" in updates or next_auth is not None:
                 user_cursor.bump_auth_version(target_uid)
