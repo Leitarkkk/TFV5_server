@@ -7378,6 +7378,47 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "blocked": user_cursor.list_blocked_by(uid),
         }, ensure_ascii=False)
 
+    FRIEND_ACCEPTED_GREETING = "已通过好友申请，现在可以开始 TouchFish 聊天了。"
+
+    def send_friend_accepted_greeting(accepter_uid, requester_uid):
+        if messages_cursor is None:
+            return
+        content = FRIEND_ACCEPTED_GREETING
+        try:
+            record = messages_cursor.add_message(
+                accepter_uid, requester_uid, content, content_type="plain",
+            )
+            if record.get("duplicate"):
+                return
+            notif = build_notification(
+                "message.plain", str(record["send_time"]), content,
+                sender="U{}".format(accepter_uid), meta={"quote": -1},
+            )
+            notif["mid"] = record["mid"]
+            notif["client_mid"] = record.get("client_mid")
+            notif["quote"] = -1
+            notif["mentioned_uids"] = []
+            notif["quote_preview"] = None
+            notif["forwarded"] = -1
+            notif["forward_preview"] = None
+
+            recv_notif = dict(notif)
+            recv_notif["room_id"] = "U{}".format(accepter_uid)
+            recv_notif["room_seq"] = record.get("room_seq")
+            recv_notif["mentions_me"] = False
+            recv_notif["should_alert"] = should_alert(
+                messages_cursor, requester_uid, recv_notif["room_id"], []
+            )
+            sender_notif = dict(notif)
+            sender_notif["room_id"] = "U{}".format(requester_uid)
+            sender_notif["room_seq"] = record.get("room_seq")
+            sender_notif["mentions_me"] = False
+            sender_notif["should_alert"] = False
+            instant_contact.push_message(requester_uid, recv_notif)
+            instant_contact.push_message(accepter_uid, sender_notif)
+        except Exception as e:
+            print("[WARN] 好友通过消息失败: {}".format(e))
+
     @api("/friend/deal_ship", methods=['POST'])
     def deal_ship(req):
         uid = req["uid"]
@@ -7407,6 +7448,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if succeeded:
                 notify_user(dealt, "friend.accepted", "好友申请已通过",
                             "{} 已通过你的好友申请。".format(format_user_display(uid)), sender=uid)
+                send_friend_accepted_greeting(uid, dealt)
         else:
             user_cursor.delete_relationship(uid, dealt)
             succeeded = True
