@@ -641,6 +641,25 @@ class MessagesDb(Db):
             self._redact_recalled(record)
         return record
 
+    def recalled_mids(self, mids) -> set:
+        """
+        给定 mid 中已撤回
+        """
+        targets = [int(m) for m in (mids or []) if m is not None]
+        if not targets:
+            return set()
+        recalled = set()
+        for start in range(0, len(targets), 400):
+            chunk = targets[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.query(
+                "SELECT mid FROM messages WHERE mid IN ({}) AND deleted = 1".format(
+                    placeholders),
+                tuple(chunk),
+            )
+            recalled.update(row[0] for row in rows)
+        return recalled
+
     def request_matches(self, mid : int, sender_uid : int, receiver_uid : int,
                         content : str, content_type : str, file_hash=None,
                          quote : int = -1, group_id=None, forwarded : int = -1,

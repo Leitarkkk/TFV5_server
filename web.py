@@ -5708,7 +5708,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not group_cursor.get_essence_enabled(gid):
             return bool_res()[False]
         message = messages_cursor.get_message(mid)
-        if message is None or message.get("group_id") != gid:
+        if (message is None or message.get("group_id") != gid
+                or message.get("deleted")):
             return bool_res()[False]
         succeed = group_cursor.add_essence(gid, mid)
         if not succeed:
@@ -5766,7 +5767,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "auth_failed"})
         if not group_cursor.is_member(gid, uid):
             return json.dumps({"success": False, "error": "not_group_member"})
-        return json.dumps({"essence" : group_cursor.query_essence(gid), "essence_enabled": group_cursor.get_essence_enabled(gid)})
+        mids = group_cursor.query_essence(gid)
+        # 惰性清理：修复本次改动前遗留的「已撤回但仍被标为精华」记录
+        stale = messages_cursor.recalled_mids(mids)
+        if stale:
+            group_cursor.remove_essence_many(gid, stale)
+            mids = [m for m in mids if m not in stale]
+        return json.dumps({"essence" : mids, "essence_enabled": group_cursor.get_essence_enabled(gid)})
 
     @api("/group/remove_member", methods=['POST'])
     def remove_member(req):
@@ -6918,9 +6925,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "already_recalled"})
         if message.get("file_hash"):
             file_cursor.remove_reference(message["file_hash"], "message", mid)
-        # 撤回的若是群置顶消息，同步取消置顶，避免置顶残留
+        # 撤回的若是群置顶/精华消息，同步清理
         if message.get("group_id") is not None:
             messages_cursor.unpin_message_by_mid(mid, message["group_id"])
+            group_cursor.remove_essence(message["group_id"], mid)
 
         recalled = messages_cursor.get_message(mid)
         event = {

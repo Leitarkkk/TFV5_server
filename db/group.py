@@ -107,6 +107,28 @@ class GroupDb(Db):
             return []
         return self._parse_essence(row[0][0])
 
+    def remove_essence_many(self, gid, mids) -> set:
+        """批量遗精"""
+        targets = {int(m) for m in (mids or []) if m is not None}
+        if not targets:
+            return set()
+
+        with self.lock:
+            def _remove_many():
+                self.cursor.execute("SELECT essence FROM groups WHERE gid = ?", (gid,))
+                row = self.cursor.fetchone()
+                if not row:
+                    return set()
+                essence_list = self._parse_essence(row[0])
+                kept = [m for m in essence_list if m not in targets]
+                if len(kept) == len(essence_list):
+                    return set()
+                removed = set(essence_list) - set(kept)
+                self.cursor.execute("UPDATE groups SET essence = ? WHERE gid = ?", (json.dumps(kept), gid))
+                self.conn.commit()
+                return removed
+            return self._execute_with_retry(_remove_many)
+
     def _migrate(self):
         try:
             self.execute("ALTER TABLE groups ADD COLUMN allow_direct_join INTEGER NOT NULL DEFAULT 0")
