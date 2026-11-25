@@ -7243,7 +7243,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             for u in targets
             if flags.get(u, {}).get("show_online_status", True)
         }
-        return json.dumps({"success": True, "presence": presence}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "presence": presence,
+            "ts": int(time.time() * 1000),
+        }, ensure_ascii=False)
 
     @api("/friend/add_friend", methods=['POST'], feature=("chat", "friend_request"))
     def add_friend(req):
