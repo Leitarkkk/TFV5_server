@@ -7162,15 +7162,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "success": True, "room_id": room_id, "mid": mid, "hidden": True,
                 }, ensure_ascii=False)
             state = messages_cursor.get_read_state(target_id, room_key)
-            peer_seq = state["last_read_seq"] if state else 0
             peer_mid = state["last_read_mid"] if state else 0
+            genuine_seq = state["genuine_seq"] if state else 0
             return json.dumps({
                 "success": True,
                 "room_id": room_id,
                 "mid": mid,
                 "hidden": False,
-                "read": peer_seq >= cursor[0],
-                "reader_last_seq": peer_seq,
+                "read": genuine_seq >= cursor[0],
+                "reader_last_seq": genuine_seq,
                 "reader_last_mid": peer_mid,
             }, ensure_ascii=False)
 

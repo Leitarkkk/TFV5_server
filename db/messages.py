@@ -4,8 +4,8 @@ import time
 
 
 class MessagesDb(Db):
-    # 事件行：content 为版本化 JSON 信封，随消息流同步（占 room_seq），
-    # 但不是用户可见内容
+    # 事件行：content 为版本化 JSON 信封，随消息流同步
+    # 占 room_seq
     EVENT_CONTENT_TYPE = "event"
     EVENT_VERSION = 1
 
@@ -17,7 +17,11 @@ class MessagesDb(Db):
 
     @staticmethod
     def room_key_of(sender_uid: int, receiver_uid: int, group_id=None) -> str:
-        """房间的规范化 key：私聊为排序后的 UminUmax，群聊为 Ggid。"""
+        """
+        房间的规范化 key
+        私聊为排序后的 UminUmax
+        群聊为 Ggid
+        """
         if group_id is not None:
             return "G{}".format(group_id)
         lo, hi = (sender_uid, receiver_uid) if sender_uid < receiver_uid \
@@ -123,9 +127,7 @@ class MessagesDb(Db):
         self._backfill_room_sequences()
 
     def _backfill_room_sequences(self):
-        """为旧数据回填 room_key / room_seq（按 mid 升序、每房间从 1 递增）。
-
-        幂等：仅处理 room_seq IS NULL 的行，重复执行安全。
+        """为旧数据回填 room_key / room_seq
         """
         with self.lock:
             def operation():
@@ -215,9 +217,7 @@ class MessagesDb(Db):
                           file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq),
                     )
                     mid = self.cursor.lastrowid
-                    # 发送即已读：自己的新消息自动推进自己在房间内的已读水位。
-                    # genuine=False：这只是「自己的未读不该算自己」，不是「读过
-                    # 别人的消息」，不能写 last_read_mid（否则群已读人数会偏高）。
+                    # 发送即已读
                     self._advance_read_watermark_locked(
                         sender_uid, room_key, room_seq, mid, genuine=False)
                     self.conn.commit()
@@ -264,9 +264,6 @@ class MessagesDb(Db):
                       group_id: int = None) -> list:
         """返回历史消息，按 mid 倒序排列。
 
-        按规范 room_key 检索（命中 (room_key, mid) 索引，LIMIT 可提前终止）；
-        不能用 room_seq 排序：撤回会把行搬到序列末尾，room_seq 与 mid 不同序。
-        调用方负责成员/好友资格校验。
         """
         room_key = self.room_key_of(uid, target_uid, group_id)
         where = "room_key = ? AND content_type != 'event'"
@@ -286,11 +283,8 @@ class MessagesDb(Db):
     def query_sync(self, room_key: str, after_seq: int = 0,
                    after_mid: int = 0, limit: int = 100,
                    include_events: bool = True) -> list:
-        """按房间增量同步：优先按 room_seq，其次按 mid，升序返回。
-
-        返回 serialized rows（含 room_seq），配合 current_seq 使用。
-        include_events=False 时过滤事件行（旧的、未声明事件流能力的客户端；
-        被过滤的 seq 在客户端表现为永久空洞，由其既有墓碑空洞逻辑消化）。
+        """按房间增量同步：优先按 room_seq，其次按 mid
+        升序返回
         """
         if after_seq < 0:
             after_seq = 0
@@ -318,7 +312,7 @@ class MessagesDb(Db):
         return self.serialize_rows(rows)
 
     def sync_cursor_for_mid(self, room_key: str, mid: int):
-        """返回房间内 mid 的 (room_seq, deleted)，跨房间或不存在时返回 None。"""
+        """返回房间内 mid 的 (room_seq, deleted)"""
         rows = self.query(
             "SELECT room_seq, deleted FROM messages WHERE room_key = ? AND mid = ?",
             (room_key, mid),
@@ -326,7 +320,7 @@ class MessagesDb(Db):
         return (rows[0][0], bool(rows[0][1])) if rows else None
 
     def sync_after_seq_for_mid(self, room_key: str, mid: int):
-        """将旧客户端的 mid 游标转换为房间序号，不存在或跨房间时返回 None。"""
+        """将旧客户端的 mid 游标转换为房间序号"""
         cursor = self.sync_cursor_for_mid(room_key, mid)
         if cursor is None or cursor[0] is None:
             return None
@@ -335,7 +329,7 @@ class MessagesDb(Db):
 
     def query_missing_sequences(self, room_key: str, sequences: list,
                                 include_events: bool = True) -> list:
-        """按具体房间序号（缺失缺口）取消息，升序返回 serialized rows。"""
+        """按具体房间序号取消息，升序返回"""
         sequences = sorted({int(s) for s in sequences if s is not None})
         if not sequences:
             return []
@@ -389,7 +383,7 @@ class MessagesDb(Db):
 
     @staticmethod
     def _redirect_entry(record: dict) -> dict:
-        """构建单条消息的转发快照"""
+        """单条消息的转发快照"""
         return {
             "mid": record["mid"],
             "sender_uid": record["sender_uid"],
@@ -409,7 +403,7 @@ class MessagesDb(Db):
 
     def build_redirect_snapshot(self, sender_uid: int, mids: list,
                                 group_name: str = "") -> dict:
-        """按时间序冻结所选消息为合并转发。
+        """按时间序冻结所选消息为合并转发
         """
         records = self.get_messages_by_mids(mids)
         ordered = sorted(
@@ -507,11 +501,8 @@ class MessagesDb(Db):
         return self._quote_preview(quoted)
 
     def get_chat_list(self, uid: int) -> list:
-        """返回与每个用户的最新单聊消息。
-        群聊由 API 接口单独合并。
-
-        last_seq 为该房间当前序号（含墓碑/事件行，与 /message/sync 的
-        current_seq 同语义），客户端可用它免一次基线往返。
+        """返回与每个用户的最新单聊消息
+        群聊由 API 接口单独合并
         """
         rows = self.query(
             """SELECT
@@ -552,10 +543,7 @@ class MessagesDb(Db):
         ]
 
     def get_group_last_messages(self, group_ids: list) -> dict:
-        """批量获取多个群聊的最新消息，单次查询。
-
-        last_seq 语义同 get_chat_list：房间当前序号（含墓碑/事件行），
-        由一次 GROUP BY 聚合取 MAX(room_seq)，替换逐群相关子查询。
+        """批量获取多个群聊的最新消息
         """
         if not group_ids:
             return {}
@@ -604,7 +592,7 @@ class MessagesDb(Db):
         r = rows[0]
         if r[3]:  # deleted
             return False
-        if r[4] == 'event':  # 事件行不是用户内容，不能引用
+        if r[4] == 'event':  # 事件行不是用户内容
             return False
         if group_id is not None:
             return r[2] == group_id
@@ -689,15 +677,7 @@ class MessagesDb(Db):
         return self.get_message(rows[0][0]) if rows else None
 
     def recall_message(self, mid: int, deleted_by: int, emit_event: bool = True) -> int:
-        """撤回消息：置 deleted 并把该行搬到序列末尾
-
-        事件轨道（双写过渡）：同时追加一条 message.recalled 事件行占用新 room_seq，
-        声明了 event_stream_v1 能力的客户端经 sync 消费；未声明能力的客户端
-        在 sync 中被过滤、把被过滤的 seq 当作永久空洞处理。
-
-        emit_event=False 用于内部回滚（文件引用失败时撤销刚建的消息），不需要事件行。
-
-        返回墓碑的新 room_seq（>0 表示成功），失败返回 0。
+        """撤回消息
         """
         with self.lock:
             def operation():
@@ -793,7 +773,7 @@ class MessagesDb(Db):
         }
 
     def get_room_preference_map(self, uids, room_id: str) -> dict:
-        """批量获取多个用户对同一房间的通知偏好，单次查询。"""
+        """批量获取多个用户对同一房间的通知偏好"""
         uids = [int(uid) for uid in set(uids)]
         if not uids:
             return {}
@@ -874,14 +854,15 @@ class MessagesDb(Db):
         if row is not None:
             last_seq, last_mid = row[0], row[1]
             if last_seq is not None and last_seq >= seq:
-                if not genuine or (last_mid or 0) > 0:
+                if not genuine:
                     return False
-                self.cursor.execute(
-                    "UPDATE room_read_state SET last_read_mid = ?, updated_at = ? "
-                    "WHERE uid = ? AND room_key = ?",
-                    (mid, now, uid, room_key),
-                )
-                return True
+                if int(mid or 0) > int(last_mid or 0):
+                    self.cursor.execute(
+                        "UPDATE room_read_state SET last_read_mid = ?, updated_at = ? "
+                        "WHERE uid = ? AND room_key = ?",
+                        (mid, now, uid, room_key),
+                    )
+                return int(mid or 0) > 0
             if genuine:
                 self.cursor.execute(
                     "UPDATE room_read_state SET last_read_seq = ?, last_read_mid = ?, updated_at = ? "
@@ -915,14 +896,25 @@ class MessagesDb(Db):
             return self._execute_with_retry(operation)
 
     def get_read_state(self, uid: int, room_key: str):
+        """读取已读状态"""
         rows = self.query(
-            "SELECT last_read_seq, last_read_mid FROM room_read_state "
-            "WHERE uid = ? AND room_key = ?",
+            "SELECT s.last_read_seq, s.last_read_mid, m.room_seq, m.deleted "
+            "FROM room_read_state s "
+            "LEFT JOIN messages m ON m.mid = s.last_read_mid "
+            "WHERE s.uid = ? AND s.room_key = ?",
             (uid, room_key),
         )
         if not rows:
             return None
-        return {"last_read_seq": rows[0][0], "last_read_mid": rows[0][1]}
+        last_read_seq, last_read_mid, genuine_seq, deleted = rows[0]
+        # 撤回会把 mid 挪到序列末尾
+        if genuine_seq is None or deleted:
+            genuine_seq = 0
+        return {
+            "last_read_seq": last_read_seq,
+            "last_read_mid": last_read_mid,
+            "genuine_seq": int(genuine_seq or 0),
+        }
 
     def read_states_for_room(self, room_key: str, min_seq: int):
         """房间内读到 >= min_seq的成员列表
@@ -974,7 +966,10 @@ class MessagesDb(Db):
             )
 
     def _count_unread(self, uid: int, keys, mentions_only: bool = False) -> dict:
-        """统计未读：room_seq 高于、非自己发送、非事件行、未删除。"""
+        """
+        统计未读
+        room_seq 高于、非自己发送、非事件行、未删除
+        """
         placeholders = ",".join("?" * len(keys))
         if mentions_only:
             sql = """SELECT m.room_key, COUNT(DISTINCT m.mid)
@@ -1005,11 +1000,7 @@ class MessagesDb(Db):
         return {r[0]: int(r[1]) for r in rows}
 
     def bulk_unread_counts(self, uid: int, room_keys, notify_level_map=None) -> dict:
-        """批量计算各房间未读条数。
-
-        notify_level_map: room_key -> 0/1/2。level 2 恒为 0（免打扰），
-        level 1 只计 @了我 的消息，level 0 计全部（未在 map 中的按 0 处理）。
-        返回 room_key -> count（未读为 0 的房间省略）。
+        """批量计算各房间未读条数
         """
         keys = [k for k in set(room_keys) if k]
         if not keys:
@@ -1095,3 +1086,5 @@ class MessagesDb(Db):
             "pinned_by_uid": record[3],
             "created_at": record[4],
         }
+
+# wyf dl tql
