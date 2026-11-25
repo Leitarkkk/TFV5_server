@@ -16,13 +16,32 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 
 ## 入群机制
 
-群聊支持两种入群方式（由创建者配置）：
+**可被搜索 与 允许加入 独立**：
 
-1. **直接加入**（`allow_direct_join = true`，`require_review = false`）：用户可直接加入，无需审核。
-2. **申请后审核**（`allow_direct_join = true`，`require_review = true`）：用户提交入群申请，管理员/群主审批后加入。
-3. **仅邀请**（`allow_direct_join = false`）：用户无法主动加入，只能通过群成员邀请加入。
+- `searchable`：群是否出现在 `/group/search`（按群名或 GID）。默认 `true`。
+  设为 `false` 后群不会出现在任何搜索结果里。通过 GID 直达、邀请仍可正常打开群资料。
+- `join_policy`：进群策略。
 
-无论如何，群内成员也可以直接邀请好友；管理员/群主邀请时可绕过审核直接拉人。
+`join_policy` 取值：
+
+| 取值 | 含义 | 自己申请加入 | 成员邀请 |
+| --- | --- | --- | --- |
+| `open` | 允许自由加入 | 直接入群 | 直接入群 |
+| `approval` | 允许审批加入 | 提交申请，管理员审批 | 提交申请（管理员邀请直接入群） |
+| `invite` | 仅允许邀请 | 拒绝（`forbidden`） | 直接入群 |
+| `admin_invite` | 仅允许管理员邀请 | 拒绝（`forbidden`） | 仅群主/管理员可邀请，直接入群 |
+
+`allow_direct_join` / `require_review` 保留为**兼容**，由 `join_policy` 唯一决定：
+
+| join_policy | allow_direct_join | require_review |
+| --- | --- | --- |
+| `open` | 1 | 0 |
+| `approval` | 1 | 1 |
+| `invite` | 0 | 0 |
+| `admin_invite` | 0 | 1 |
+
+新客户端应只读写 `join_policy` / `searchable`。
+
 
 ## Secret API
 
@@ -39,8 +58,8 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "groupname" : <groupname>,
     "introduction" : <introduction>,
     "enter_hint" : <enter_hint>,
-    "allow_direct_join" : <allow_direct_join>,
-    "require_review" : <require_review>
+    "join_policy" : <join_policy>,
+    "searchable" : <searchable>
 }
 ```
 
@@ -48,8 +67,10 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 - `<groupname>`（必填）是群名称。
 - `<introduction>`（可选，默认 `""`）是群简介。
 - `<enter_hint>`（可选，默认 `""`）是入群欢迎语，显示在聊天界面。
-- `<allow_direct_join>`（可选，默认 `false`）是否允许用户直接申请入群。
-- `<require_review>`（可选，默认 `true`）是否需要对入群申请进行审核。仅在 `allow_direct_join` 为 `true` 时有效。
+- `<join_policy>`（可选，默认 `approval`）入群策略，取值见「入群机制」。非法值返回 `invalid_request`。
+- `<searchable>`（可选，默认 `true`）是否可被搜索到。
+- 兼容：仍接受旧的 `allow_direct_join` / `require_review`。只给这两个字段时按上表反推策略；
+  两者都不给时使用新默认策略 `approval`（**不是**旧默认的 `admin_invite`）。
 
 返回：创建成功返回 `{"gid": <gid>}`；失败返回 JSON 错误对象 `{"success": false, "error": "<错误码>"}`
 （**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)回 bool 接口的纯文本；
@@ -96,6 +117,8 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "require_review" : <true_or_false>,
     "public_messages" : <true_or_false>,
     "essence_enabled" : <true_or_false>,
+    "join_policy" : <join_policy>,
+    "searchable" : <true_or_false>,
     "members" : [
         { "uid" : <uid>, "username" : <username>, "role" : "owner" | "admin" | "member" }
     ]
@@ -147,7 +170,9 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "allow_direct_join" : <true_or_false>,
     "require_review" : <true_or_false>,
     "essence_enabled" : <true_or_false>,
-    "public_messages" : <true_or_false>
+    "public_messages" : <true_or_false>,
+    "searchable" : <true_or_false>,
+    "join_policy" : <join_policy>
 }
 ```
 
@@ -165,14 +190,18 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "groupname" : <new_groupname>,
     "enter_hint" : <new_enter_hint>,
     "introduction" : <new_introduction>,
-    "allow_direct_join" : <true_or_false>,
-    "require_review" : <true_or_false>,
+    "join_policy" : <join_policy>,
+    "searchable" : <true_or_false>,
     "essence_enabled" : <true_or_false>,
     "public_messages" : <true_or_false>
 }
 ```
 
 以上字段均为可选，只更新传入的字段。仅群主（`is_admin == 2`）可操作。
+
+- `join_policy` 非法值直接返回失败（不会部分写入），并同步派生 `allow_direct_join` / `require_review`。
+- `searchable` 只影响能否被搜索，不影响已有的邀请、GID 直达与群资料访问。
+- 兼容：仍接受 `allow_direct_join` / `require_review`；同时传 `join_policy` 时以 `join_policy` 为准。
 
 > `public_messages` 为 `true` 时允许非群成员只读查看该群历史消息。
 
@@ -232,14 +261,14 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 }
 ```
 
-需要群设置为 `allow_direct_join = true`。
+需要群 `join_policy` 为 `open` 或 `approval`；`invite` / `admin_invite` 一律返回 `forbidden`。
 
 `<request_message>`（可选）为申请留言，长度上限为服务器配置 `max_request_message_length`（默认 200），
 超长返回 `request_message_too_long`。重复申请时只更新最新留言与时间，不新增申请记录。
 
 返回：
-- 若无需审核（`require_review = false`），直接加入成功返回 `{"pending": false}`。
-- 若需审核，创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知（通知 meta 携带 `message`）。
+- `join_policy = open`：直接加入成功返回 `{"pending": false}`。
+- `join_policy = approval`：创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知（通知 meta 携带 `message`）。
 - 失败返回 JSON 错误对象 `{"success": false, "error": "<错误码>"}`（**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)回 bool 接口的纯文本）：`auth_failed` / `banned` / `not_found`（群不存在）/
   `conflict`（已在群内、群人数已满）/ `unavailable`（写入失败）/ `forbidden`（该群当前不接受直接加入）/ `request_message_too_long`，
   `detail_error` 模式下为规范化错误码。
@@ -266,8 +295,11 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 免审直入路径不使用该字段。重复邀请同样只更新最新留言与时间。
 
 返回：
-- 若群无需审核（`require_review = false`）或邀请者是管理员/群主，被邀请者直接加入，返回 `{"pending": false}`。被邀请者收到 `group.invited` 通知。
-- 否则创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知，被邀请者也会收到 `group.invited.pending` 通知。
+- `join_policy = admin_invite` 且邀请者不是群主/管理员：`forbidden`。
+- `join_policy = approval` 且邀请者是普通成员：创建入群申请，返回 `{"rid": <rid>, "pending": true}`。
+  群主和所有管理员会收到 `group.join.request` 通知，被邀请者也会收到 `group.invited.pending` 通知。
+- 其余情况（`open` / `invite` / `admin_invite` 的管理员邀请 / `approval` 的管理员邀请）：被邀请者直接加入，
+  返回 `{"pending": false}`，被邀请者收到 `group.invited` 通知。
 
 ---
 

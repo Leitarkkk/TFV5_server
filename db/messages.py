@@ -280,6 +280,27 @@ class MessagesDb(Db):
         params.append(limit)
         return self.query(sql, tuple(params))
 
+    def search_room_messages(self, uid: int, target_uid: int, keyword: str,
+                             before_mid: int = 0, limit: int = 20,
+                             group_id: int = None) -> list:
+        """
+        在单个房间内按关键词搜索历史消息
+        """
+        if not isinstance(keyword, str) or not keyword:
+            return []
+        room_key = self.room_key_of(uid, target_uid, group_id)
+        where = ("room_key = ? AND content_type = 'plain' AND deleted = 0"
+                 " AND instr(lower(content), ?) > 0")
+        params = [room_key, keyword.lower()]
+        if before_mid and before_mid > 0:
+            where += " AND mid < ?"
+            params.append(int(before_mid))
+        params.append(max(1, int(limit)))
+        return self.query(
+            "{} WHERE {} ORDER BY mid DESC LIMIT ?".format(self._SELECT_ALL, where),
+            tuple(params),
+        )
+
     def query_sync(self, room_key: str, after_seq: int = 0,
                    after_mid: int = 0, limit: int = 100,
                    include_events: bool = True) -> list:

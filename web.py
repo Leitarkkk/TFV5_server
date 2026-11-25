@@ -12,6 +12,7 @@ import hmac
 import ipaddress
 import re
 from db import *
+from db.group import JOIN_POLICIES
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
     USERS_COL_SHOW_READ_STATUS,
@@ -5528,8 +5529,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         enter_hint = req.get("enter_hint", "")
         allow_direct_join = bool(req.get("allow_direct_join", False))
         require_review = bool(req.get("require_review", True))
+        allow_direct_join = req.get("allow_direct_join")
+        require_review = req.get("require_review")
+        join_policy = req.get("join_policy")
+        searchable = bool(req.get("searchable", True))
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
+        if join_policy is not None and join_policy not in JOIN_POLICIES:
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_row = get_user_row(uid)
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
@@ -5542,7 +5549,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(groupname, str) or not (min_len <= len(groupname.strip()) <= max_len):
             return json.dumps({"success": False, "error": "invalid_request"})
         gid = group_cursor.create_group(uid, groupname, enter_hint, introduction,
-                                        allow_direct_join, require_review)
+                                        allow_direct_join=allow_direct_join,
+                                        require_review=require_review,
+                                        join_policy=join_policy,
+                                        searchable=searchable)
         if gid:
             return json.dumps({"gid": gid})
         return json.dumps({"success": False, "error": "unavailable"})
@@ -5584,19 +5594,36 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/group/search", methods=['POST'])
     def group_search(req):
-        """按群名搜索群组（分页）"""
+        """按群名搜索群组（分页）
+        纯数字关键词按 GID 精确查找
+        """
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
+
+        raw_keyword = str(req.get("keyword") or "").strip()
+        gid = None
+        if raw_keyword.isascii() and raw_keyword.isdigit() and len(raw_keyword) <= 18:
+            gid = int(raw_keyword)
+
         keyword, limit, offset, err = normalize_search_request(
-            req.get("keyword"), read_config().get("min_search_length", 2),
+            raw_keyword,
+            0 if gid is not None else read_config().get("min_search_length", 2),
             req.get("limit", 20), req.get("offset", 0),
         )
         if err:
             return json.dumps({"success": False, "error": err})
+        if gid is not None and offset == 0:
+            hit = group_cursor.lookup_by_gid(gid)
+            if hit is not None:
+                return json.dumps(
+                    {"success": True, "groups": [hit], "has_more": False},
+                    ensure_ascii=False,
+                )
+
         groups, has_more = group_cursor.search_public(keyword, limit=limit, offset=offset)
         return json.dumps(
             {"success": True, "groups": groups, "has_more": has_more},
@@ -5648,6 +5675,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "require_review": settings["require_review"],
             "public_messages": settings["public_messages"],
             "essence_enabled": settings["essence_enabled"],
+            # 加入策略与可搜索性
+            "join_policy": settings["join_policy"],
+            "searchable": settings["searchable"],
             "members": members,
         }
         if is_member:
@@ -5950,9 +5980,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         updates = {}
         for key in ("groupname", "enter_hint", "introduction",
                      "allow_direct_join", "require_review", "essence_enabled",
-                     "public_messages"):
+                     "public_messages", "searchable", "join_policy"):
             if key in req:
                 updates[key] = req[key]
+        if "join_policy" in updates and updates["join_policy"] not in JOIN_POLICIES:
+            return bool_res()[False]
         if "groupname" in updates:
             cfg = read_config()
             min_len = cfg.get("min_group_name_length", 1)
@@ -6104,25 +6136,26 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         request_message = str(req.get("message", "") or "").strip()
         if max_len > 0 and len(request_message) > max_len:
             return json.dumps({"success": False, "error": "request_message_too_long"})
-        if settings["allow_direct_join"]:
-            if not settings["require_review"]:
-                succeeded = group_cursor.add_member(gid, uid)
-                if succeeded:
-                    return json.dumps({"pending": False})
-                return json.dumps({"success": False, "error": "unavailable"})
-            else:
-                members = group_cursor.get_member_uids(gid)
-                cfg = read_config()
-                limit = cfg.get("single_group_max_people", 200)
-                if limit != -1 and len(members) >= limit:
-                    return json.dumps({"success": False, "error": "conflict"})
-                rid = group_cursor.request_join(gid, uid, message=request_message)
-                reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
-                run_notification_side_effect("group.join.request",
-                    lambda: notify_users(reviewers, "group.join.request",
-                        "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
-                        sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
-                return json.dumps({"rid": rid, "pending": True})
+        # 加入策略
+        policy = settings["join_policy"]
+        if policy == "open":
+            succeeded = group_cursor.add_member(gid, uid)
+            if succeeded:
+                return json.dumps({"pending": False})
+            return json.dumps({"success": False, "error": "unavailable"})
+        if policy == "approval":
+            members = group_cursor.get_member_uids(gid)
+            cfg = read_config()
+            limit = cfg.get("single_group_max_people", 200)
+            if limit != -1 and len(members) >= limit:
+                return json.dumps({"success": False, "error": "conflict"})
+            rid = group_cursor.request_join(gid, uid, message=request_message)
+            reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
+            run_notification_side_effect("group.join.request",
+                lambda: notify_users(reviewers, "group.join.request",
+                    "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
+            return json.dumps({"rid": rid, "pending": True})
         return json.dumps({"success": False, "error": "forbidden"})
 
     @api("/group/invite", methods=['POST'], feature=("chat", "group_chat"))
@@ -6153,27 +6186,33 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if max_len > 0 and len(invite_message) > max_len:
             return json.dumps({"success": False, "error": "request_message_too_long"})
         is_admin = group_cursor.is_admin(gid, uid) >= 1
-        if not settings["require_review"] or is_admin:
-            succeeded = group_cursor.add_member(gid, invited_uid)
-            if succeeded:
-                run_notification_side_effect("group.invited",
-                    lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
-                        "{} 邀请你加入群 {}。".format(format_user_display(uid), settings["groupname"]),
-                        sender=uid, meta={"gid": gid}))
-                return json.dumps({"pending": False})
-            return json.dumps({"success": False, "error": "unavailable"})
-        rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
-                                        message=invite_message)
-        reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
-        run_notification_side_effect("group.join.request",
-            lambda: notify_users(reviewers, "group.join.request",
-                "新的入群申请", "{} 邀请 {} 加入群 {}，等待审核。".format(format_user_display(uid), format_user_display(invited_uid), settings["groupname"]),
-                sender=uid, meta={"gid": gid, "rid": rid, "message": invite_message}))
-        run_notification_side_effect("group.invited.pending",
-            lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
-                "{} 邀请你加入群 {}（需审核）。".format(format_user_display(uid), settings["groupname"]),
-                sender=uid, meta={"gid": gid, "rid": rid}))
-        return json.dumps({"rid": rid, "pending": True})
+        policy = settings["join_policy"]
+        # 仅管理员邀请
+        if policy == "admin_invite" and not is_admin:
+            return json.dumps({"success": False, "error": "forbidden"})
+        # 审批加入
+        if policy == "approval" and not is_admin:
+            rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
+                                            message=invite_message)
+            reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
+            run_notification_side_effect("group.join.request",
+                lambda: notify_users(reviewers, "group.join.request",
+                    "新的入群申请", "{} 邀请 {} 加入群 {}，等待审核。".format(format_user_display(uid), format_user_display(invited_uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid, "message": invite_message}))
+            run_notification_side_effect("group.invited.pending",
+                lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
+                    "{} 邀请你加入群 {}（需审核）。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid}))
+            return json.dumps({"rid": rid, "pending": True})
+        # open / invite / admin_invite(管理员) / approval(管理员)
+        succeeded = group_cursor.add_member(gid, invited_uid)
+        if succeeded:
+            run_notification_side_effect("group.invited",
+                lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
+                    "{} 邀请你加入群 {}。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid}))
+            return json.dumps({"pending": False})
+        return json.dumps({"success": False, "error": "unavailable"})
 
     @api("/group/join_requests", methods=['POST'])
     def join_requests(req):
@@ -7032,6 +7071,77 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             before_mid=before_mid, limit=limit, group_id=group_id)
         records = messages_cursor.serialize_rows(rows)
         return json.dumps(enrich_message_files(records), ensure_ascii=False)
+
+    @api("/message/search", methods=['POST'])
+    def message_search(req):
+        """在单个会话内按关键词搜索历史消息
+        """
+        uid = req["uid"]
+        password = req["password"]
+        try:
+            has_target = req.get("target_uid") is not None
+            target_uid = int(req.get("target_uid", 0)) if has_target else 0
+            group_id = req.get("group_id")
+            before_mid = int(req.get("before_mid", 0))
+            if group_id is not None:
+                group_id = int(group_id)
+        except (ValueError, TypeError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        user_row = get_user_row(uid)
+        if user_row is None:
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if user_row[4] in _BLOCKED_STATS:
+            return json.dumps({"success": False, "error": "banned"})
+        if not check_search_rate(uid):
+            return json.dumps({"success": False, "error": "rate_limited"})
+
+        keyword, limit, _offset, err = normalize_search_request(
+            req.get("keyword"), read_config().get("min_search_length", 2),
+            req.get("limit", 20),
+        )
+        if err:
+            return json.dumps({"success": False, "error": err})
+
+        if group_id is not None:
+            if not group_cursor.is_member(group_id, uid):
+                settings = group_cursor.get_group_settings(group_id)
+                if not settings or not settings.get("public_messages"):
+                    return json.dumps({"success": False, "error": "not_group_member"})
+                limit = min(limit, 50)
+        elif has_target:
+            if not user_cursor.is_friend(uid, target_uid):
+                return json.dumps({"success": False, "error": "not_friends"})
+        else:
+            return json.dumps({"success": False, "error": "not_friends"})
+
+        before_mid = max(0, before_mid)
+        rows = messages_cursor.search_room_messages(
+            uid, target_uid, keyword,
+            before_mid=before_mid, limit=limit, group_id=group_id,
+        )
+        records = enrich_message_files(messages_cursor.serialize_rows(rows))
+        sender_uids = sorted({
+            record.get("sender_uid") for record in records
+            if record.get("sender_uid") is not None
+        })
+        if sender_uids:
+            placeholders = ",".join("?" * len(sender_uids))
+            name_rows = user_cursor.query(
+                "SELECT uid, username FROM users WHERE uid IN ({})".format(
+                    placeholders),
+                tuple(sender_uids),
+            )
+            name_map = {row[0]: row[1] for row in name_rows}
+            for record in records:
+                record["sender_name"] = name_map.get(record.get("sender_uid"))
+        return json.dumps({
+            "success": True,
+            "messages": records,
+            "has_more": len(records) >= limit,
+        }, ensure_ascii=False)
 
     @api("/message/sync", methods=['POST'])
     def message_sync(req):

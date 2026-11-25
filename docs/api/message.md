@@ -369,6 +369,48 @@ TFV5 的消息系统由两部分组成：
 
 ---
 
+### 搜索会话内消息
+
+- `^ POST /message/search` 在单个会话内按关键词搜索历史消息（按 `mid` 倒序分页）。
+
+请求体：
+
+```json
+{
+    "target_uid" : <target_uid>,
+    "group_id" : <group_id>,
+    "keyword" : "<keyword>",
+    "before_mid" : <before_mid>,
+    "limit" : <limit>
+}
+```
+
+其中：
+
+- `target_uid` / `group_id` 语义与 `/message/history` 相同，二选一。
+- `<keyword>`（必填）关键词，长度不得小于服务器配置 `min_search_length`（默认 2），过短返回 `search_keyword_too_short`。
+- `<before_mid>`（可选，默认 `0` 即从最新开始）翻页游标，传上一页结果中最小的 `mid`。
+- `<limit>`（可选，默认 `20`，上限 `20`）。
+
+返回体：
+
+```json
+{
+    "success" : true,
+    "messages" : [ <消息对象>, ... ],
+    "has_more" : <bool>
+}
+```
+
+说明：
+
+- 只匹配 `content_type = "plain"` 且未撤回的消息，匹配为大小写不敏感的**子串**匹配。
+- 每条记录额外带上 `sender_name`（发送者用户名，查不到时为 `null`），客户端无需为久远消息逐条拉取用户资料。
+- 权限与 `/message/history` 一致：私聊需好友、群聊需成员（`public_messages` 例外，仅需只读预览权限）。
+- 受搜索限流约束（默认每 10 秒最多 20 次），超出返回 `rate_limited`。
+
+---
+
 ### 增量同步
 
 *注意：不再兼容旧版协议。增量同步为新版协议内容。*
