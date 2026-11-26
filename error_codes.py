@@ -48,6 +48,7 @@ ERRORS = {
     "user_banned": ("RESOURCE_USER_BANNED", "User account is banned", 403),
     "banned": ("RESOURCE_USER_BANNED", "User account is banned", 403),
     "account_banned": ("account_banned", "User account is banned", 403),
+    "account_readonly": ("account_readonly", "Account is read-only due to a ban", 403),
     "account_muted": ("account_muted", "User account is muted", 403),
     "pending_activation": ("pending_activation", "Account activation is pending", 403),
     "file_not_owned": ("FILE_NOT_OWNED", "You do not own this file", 403),

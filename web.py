@@ -1,6 +1,7 @@
 from flask import Flask, send_file, redirect, request as flask_request, g as flask_g
 from flask import render_template_string, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
+import functools
 import json
 import register_tool
 import captcha_service
@@ -13,6 +14,7 @@ import ipaddress
 import re
 from db import *
 from db.group import JOIN_POLICIES
+from db.punishments import PUNISHMENT_KINDS
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
     USERS_COL_SHOW_READ_STATUS,
@@ -303,6 +305,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 row = user_cursor.uid_query(uid)
                 if not row:
                     return False, {"error": "auth_failed"}
+                rejected = _full_ban_rejection(int(uid))
+                if rejected is not None:
+                    return False, rejected
                 identity = {"uid": int(uid), "stat": row[0][4]}
                 flask_g.auth_identity = identity
                 return True, (identity, True)
@@ -315,6 +320,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         row = user_cursor.uid_query(uid)
         if not row:
             return False, {"error": "auth_failed"}
+        rejected = _full_ban_rejection(int(uid))
+        if rejected is not None:
+            return False, rejected
         identity = {"uid": int(uid), "stat": row[0][4]}
         flask_g.auth_identity = identity
         return True, (identity, True)
@@ -338,8 +346,29 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         return response
 
-    api = return_app_route(app, pri, resolve_auth,
-                           feature_checker=lambda path: feature_gate(read_config(), *path))
+    _route_api = return_app_route(
+        app, pri, resolve_auth,
+        feature_checker=lambda path: feature_gate(read_config(), *path))
+
+    def api(*args, **kwargs):
+        """
+        写入检查
+        """
+        route = _route_api(*args, **kwargs)
+        path = args[0] if args else kwargs.get("path", "")
+
+        def decorator(func):
+            @functools.wraps(func)
+            def guarded(req, *a, **kw):
+                blocked = _readonly_write_block(req.get("uid"), path)
+                if blocked is not None:
+                    return json.dumps({"success": False, "error": blocked})
+                return func(req, *a, **kw)
+
+            return route(guarded)
+
+        return decorator
+
     limiter = RateLimiter(port_api)
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "pending", "admin", "root"}
@@ -353,6 +382,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if punishments_cursor is None:
             return None
         return punishments_cursor.active_ban(uid)
+
+    def _full_ban_rejection(uid):
+        """完全封禁连读都不允许。
+
+        本地/外部 JWT 由 `auth_version` 保证（封禁时 bump 会立刻失效），
+        但 legacy（uid+password）认证不校验版本，必须在这里补一道，
+        否则完全封禁的账号可以继续用密码读接口。
+        """
+        if _active_ban(uid) is not None:
+            return {"error": "account_banned"}
+        return None
 
     def _content_block(uid, user_stat):
         if user_stat == "pending":
@@ -368,10 +408,83 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if punishment is None:
             return None
         kind = punishment[2]
-        if kind == "ban":
+        if kind == "ban_full":
             return "account_banned"
+        if kind == "ban":
+            # 只读封禁：能登录、能浏览，但内容写入一律拒绝
+            return "account_readonly"
         if kind == "mute":
             return "account_muted"
+        return None
+
+    # 写入路径
+    _READONLY_BLOCKED_PATHS = frozenset({
+        # 消息与会话设置
+        "/message/send", "/message/redirect", "/message/recall",
+        "/chat/preferences/update",
+        # 好友关系
+        "/friend/add_friend", "/friend/deal_ship",
+        "/friend/block", "/friend/unblock",
+        # 群
+        "/group/create_group", "/group/update_settings", "/group/delete_group",
+        "/group/join", "/group/invite", "/group/invite_member",
+        "/group/handle_join_request", "/group/leave", "/group/remove_member",
+        "/group/add_admin", "/group/remove_admin", "/group/transfer_owner",
+        "/group/pin_message", "/group/unpin_message",
+        "/group/add_essence", "/group/remove_essence",
+        # 论坛
+        "/forum/create_forum", "/forum/edit_forum", "/forum/remove_forum",
+        "/forum/send_post", "/forum/comment", "/forum/remove_post",
+        "/forum/remove_comment", "/forum/join", "/forum/leave",
+        "/forum/add_member", "/forum/remove_member",
+        "/forum/change_member_role", "/forum/pin_post", "/forum/unpin_post",
+        "/forum/approve_forum", "/forum/reject_forum",
+        # 自身信息
+        "/auth/change_pwd", "/auth/change_email", "/auth/change_email_verify",
+        "/auth/change_sign", "/auth/change_introduction",
+        "/auth/change_privacy", "/auth/change_public_email",
+        "/auth/change_captcha", "/auth/change_rate_limits",
+        "/auth/devices/update_label", "/auth/devices/revoke",
+        "/auth/sessions/rename", "/auth/sessions/revoke",
+        "/auth/sessions/revoke_all", "/auth/tokens/revoke",
+        "/auth/platform/bind", "/auth/platform/unbind",
+        "/auth/external/bind", "/auth/external/unbind",
+        # 头像
+        "/avatar/upload_user_avatar", "/avatar/upload_forum_avatar",
+        "/avatar/upload_group_avatar", "/avatar/upload_logo",
+        "/avatar/upload_default_avatar",
+        # 文件
+        "/file/upload_file", "/file/chunked_upload", "/file/instant_upload",
+        "/file/delete_file", "/file/dereference_file",
+        # 贴图
+        "/sticker/upload",
+        "/sticker/item/create", "/sticker/item/delete", "/sticker/item/reorder",
+        "/sticker/pack/create", "/sticker/pack/delete", "/sticker/pack/update",
+        "/sticker/ownership", "/sticker/ownership/reorder",
+        # 管理操作
+        "/auth/manage/ban", "/auth/manage/unban",
+        "/auth/manage/create", "/auth/manage/delete",
+        "/auth/manage/update", "/auth/manage/signing_keys/rotate",
+        "/auth/change_auth", "/auth/server_settings/update",
+        "/punishment/create", "/punishment/revoke", "/ticket/handle",
+        "/announcement/upload_announcement", "/announcement/edit_announcement",
+        "/announcement/delete_announcement",
+        "/file/admin_force_delete_file",
+    })
+
+    def _readonly_write_block(uid, path):
+        if uid is None or path not in _READONLY_BLOCKED_PATHS:
+            return None
+        if punishments_cursor is None:
+            return None
+        restriction = punishments_cursor.active_restriction(uid)
+        if restriction is None:
+            return None
+        kind = restriction[2]
+        if kind == "ban_full":
+            return "account_banned"
+        if kind == "ban":
+            return "account_readonly"
         return None
     locks = {
         'config': threading.Lock(),
@@ -1165,26 +1278,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if punishments_cursor.active_ban(uid) is not None:
             return True, None
         punishment_id = punishments_cursor.create(
-            uid, "ban", STAT_BAN_REASON, operator_uid
+            uid, "ban_full", STAT_BAN_REASON, operator_uid
         )
         if not punishment_id:
             return False, None
         return True, punishment_id
 
-    def _revoke_stat_ban(uid, operator_uid):
-        if punishments_cursor is None:
-            return
-        now = time.time()
-        for row in punishments_cursor.list_for_user(uid):
-            if row[2] != "ban" or row[3] != STAT_BAN_REASON:
-                continue
-            if row[7] is not None:
-                continue
-            if row[6] is not None and row[6] <= now:
-                continue
-            punishments_cursor.revoke(row[0], operator_uid)
-
     def perform_managed_auth_change(uid : int, pwd : str, target_uid : int, new_auth : str):
+        """只改角色"""
+        if new_auth not in {"user", "admin", "root"}:
+            return False
         operator = verify_manager(uid, pwd)
         if operator is None:
             return False
@@ -1192,30 +1295,79 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         target = resolve_managed_target(operator[4], target_uid, next_auth=new_auth)
         if target is None:
             return False
-
-        created_ban = None
-        if new_auth == "banned":
-            ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
-            if not ok:
-                return False
+        if target[4] == "banned":
+            return False
 
         if not user_cursor.update_user_with_root_guard(target_uid, stat=new_auth):
+            return False
+
+        user_cursor.bump_auth_version(target_uid)
+        notify_user(target_uid, "auth.stat.changed", "账号状态已变更",
+                    "你的账号状态已更新为 {}。".format(new_auth),
+                    sender=uid, meta={"new_auth": new_auth})
+        return True
+
+    def perform_managed_ban(uid : int, pwd : str, target_uid : int):
+        """完全封禁：写处罚表，并同步 users.stat 镜像。
+
+        镜像必须维护：很多 handler 仍用 `stat in _BLOCKED_STATS` 做快速拒绝。
+        但事实来源是处罚表，撤销处罚即可恢复。
+        """
+        operator = verify_manager(uid, pwd)
+        if operator is None:
+            return False
+        target = resolve_managed_target(operator[4], target_uid, next_auth="banned")
+        if target is None:
+            return False
+
+        ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
+        if not ok:
+            return False
+        if not user_cursor.update_user_with_root_guard(target_uid, stat="banned"):
             if created_ban:
                 punishments_cursor.revoke(created_ban, operator[0])
             return False
-        if new_auth != "banned":
-            _revoke_stat_ban(target_uid, operator[0])
 
-        # 吊销全部 JWT；封禁时把人家的 WebSocket 全部使用尖头靴子踢掉
         user_cursor.bump_auth_version(target_uid)
-        if new_auth == "banned":
-            if not run_critical_side_effect(
-                "disconnect_banned_user",
-                lambda: instant_contact.disconnect_user(target_uid)
-            ):
+        if not run_critical_side_effect(
+            "disconnect_banned_user",
+            lambda: instant_contact.disconnect_user(target_uid)
+        ):
+            return False
+
+        notify_user(target_uid, "auth.stat.changed", "账号状态已变更",
+                    "你的账号已被封禁。", sender=uid, meta={"new_auth": "banned"})
+        return True
+
+    def perform_managed_unban(uid : int, pwd : str, target_uid : int):
+        """解封：撤销所有生效中的完全封禁处罚，并清掉 stat 镜像。
+
+        不能只改 stat 不撤处罚——那样用户仍是封禁状态（处罚表是事实来源），
+        表现为"解封了但登不上"。
+        """
+        operator = verify_manager(uid, pwd)
+        if operator is None:
+            return False
+        target = resolve_managed_target(operator[4], target_uid)
+        if target is None:
+            return False
+
+        if punishments_cursor is not None:
+            now = time.time()
+            for row in punishments_cursor.list_for_user(target_uid):
+                if row[2] != "ban_full" or row[7] is not None:
+                    continue
+                if row[6] is not None and row[6] <= now:
+                    continue
+                punishments_cursor.revoke(row[0], operator[0])
+
+        if target[4] == "banned":
+            if not user_cursor.update_user_with_root_guard(target_uid, stat="user"):
                 return False
 
-        notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
+        user_cursor.bump_auth_version(target_uid)
+        notify_user(target_uid, "punishment.revoked", "封禁已解除",
+                    "你的账号封禁已被解除，可以重新登录。", sender=uid)
         return True
     
     # 外部认证平台（TouchFish Auth）!!!!
@@ -2374,6 +2526,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             operator = verify_manager(uid, pwd)
             if operator is None:
                 return bool_res()[False]
+            if new_auth == "banned":
+                return bool_res()[False]
             if not can_manage_auth(operator[4], new_auth):
                 return bool_res()[False]
             cfg = read_config()
@@ -2399,12 +2553,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 user_cursor.delete_user(target_uid)
                 return bool_res()[False]
 
-            if new_auth == "banned":
-                ok, _created = _ensure_stat_ban(target_uid, operator[0])
-                if not ok:
-                    user_cursor.delete_user(target_uid)
-                    return bool_res()[False]
-
             if not ensure_notification_table(target_uid):
                 user_cursor.delete_user(target_uid)
                 return bool_res()[False]
@@ -2429,6 +2577,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if target is None:
                 return bool_res()[False]
 
+            if next_auth == "banned":
+                # 封禁走 /auth/manage/ban，解封走 /auth/manage/unban
+                return bool_res()[False]
+            if next_auth is not None and target[4] == "banned":
+                # 被封禁账号要先解封，改角色不能绕过处罚
+                return bool_res()[False]
             updates = collect_managed_updates(req, next_auth=next_auth)
             if not updates:
                 return bool_res()[False]
@@ -2442,27 +2596,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     or len(updates["password"]) < int(cfg.get("min_password_length", 1))):
                 return bool_res()[False]
 
-            created_ban = None
-            if next_auth == "banned":
-                ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
-                if not ok:
-                    return bool_res()[False]
-
             if not user_cursor.update_user_with_root_guard(target_uid, **updates):
-                if created_ban:
-                    punishments_cursor.revoke(created_ban, operator[0])
                 return bool_res()[False]
-            if next_auth is not None and next_auth != "banned":
-                _revoke_stat_ban(target_uid, operator[0])
 
             if "password" in updates or next_auth is not None:
                 user_cursor.bump_auth_version(target_uid)
-            if next_auth == "banned":
-                if not run_critical_side_effect(
-                    "disconnect_banned_user",
-                    lambda: instant_contact.disconnect_user(target_uid)
-                ):
-                    return bool_res()[False]
 
             if next_auth is not None:
                 notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(next_auth), sender=uid, meta={"new_auth" : next_auth})
@@ -2476,7 +2614,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             target_uid = req["change_uid"]
-            return bool_res()[perform_managed_auth_change(uid, pwd, target_uid, "banned")]
+            return bool_res()[perform_managed_ban(uid, pwd, target_uid)]
+        except Exception:
+            return bool_res()[False]
+
+    @api("/auth/manage/unban", methods=["POST"])
+    def manage_unban_user(req):
+        """解封：撤销完全封禁处罚（与 /auth/manage/ban 对称）。"""
+        try:
+            uid = req["uid"]
+            pwd = req["password"]
+            target_uid = req["change_uid"]
+            return bool_res()[perform_managed_unban(uid, pwd, target_uid)]
         except Exception:
             return bool_res()[False]
 
@@ -4327,6 +4476,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         ticket_type = req.get("type")
         if ticket_type not in ("report", "consult", "appeal"):
             return {"success": False, "error": "invalid_ticket_type"}
+
+        # 只读封禁
+        restriction = (
+            punishments_cursor.active_restriction(uid)
+            if punishments_cursor is not None else None
+        )
+        # 而且为了防止你急眼我们有先进的频率限制
+        if restriction is not None and restriction[2] in ("ban", "ban_full"):
+            if ticket_type != "appeal":
+                return {"success": False, "error": "forbidden"}
+            if not check_rate_limit(uid, "ticket_appeal_banned", 1, 86400):
+                return {"success": False, "error": "rate_limited"}
+
         if not feature_gate(read_config(), "tickets", ticket_type):
             return {"success": False, "error": "ticket_type_disabled"}
 
@@ -4633,7 +4795,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return {"success": True}
 
 
-    _PUNISHMENT_KIND_LABELS = {"warn": "警告", "mute": "禁言", "ban": "封禁"}
+    _PUNISHMENT_KIND_LABELS = {
+        "warn": "警告",
+        "mute": "禁言",
+        "ban": "封禁（只读）",
+        "ban_full": "完全封禁",
+    }
     _PUNISHMENT_NOTICE = {
         "warn": ("你收到一条警告",
                  "处罚类型：警告。理由：{reason}。"
@@ -4641,9 +4808,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         "mute": ("你已被禁言",
                  "处罚类型：禁言。理由：{reason}。"
                  "禁言期间无法发送消息、发帖和评论，仍可提交工单申诉。"),
-        "ban": ("你的账号已被封禁",
-                "处罚类型：封禁。理由：{reason}。"
-                "封禁期间无法登录，如认为有误可联系管理员申诉。"),
+        "ban": ("你的账号已被封禁为只读",
+                "处罚类型：封禁（只读）。理由：{reason}。"
+                "你无法发送消息、发帖、加好友或修改资料，"
+                "只能提交申诉类工单（限制 1 天仅可提交 1 次）。"),
+        "ban_full": ("你的账号已被完全封禁",
+                     "处罚类型：完全封禁。理由：{reason}。"
+                     "封禁期间无法登录，如认为有误可通过申诉渠道联系管理员。"),
     }
 
     def _sweep_legacy_ban(uid):
@@ -4672,7 +4843,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except (KeyError, TypeError, ValueError):
             return bool_res()[False]
         kind = req.get("kind")
-        if kind not in ("warn", "mute", "ban"):
+        if kind not in PUNISHMENT_KINDS:
             return {"success": False, "error": "invalid_kind"}
         reason = req.get("reason")
         if not isinstance(reason, str) or not reason.strip():
@@ -4701,6 +4872,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         if not punishment_id:
             return bool_res()[False]
+
+        if kind == "ban_full":
+            user_cursor.bump_auth_version(target_uid)
+            run_critical_side_effect(
+                "disconnect_banned_user",
+                lambda: instant_contact.disconnect_user(target_uid),
+            )
 
         # 不写 users.stat
         kind_label = _PUNISHMENT_KIND_LABELS.get(kind, kind)

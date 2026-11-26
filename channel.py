@@ -79,8 +79,12 @@ def content_block(punishments_cursor, uid: int, user_stat):
     if active is None:
         return None
     kind = active[2]
-    if kind == "ban":
+    if kind == "ban_full":
+        # 完全封禁
         return "account_banned"
+    if kind == "ban":
+        # 只读封禁
+        return "account_readonly"
     if kind == "mute":
         return "account_muted"
     return None
@@ -325,6 +329,14 @@ class InstantConnect():
                 return None
             return (uid, payload.get("jti"), payload.get("sid"))
         return to_thread(_check)
+
+    def _is_fully_banned(self, uid: int) -> bool:
+        """完全封禁 BOOM WS"""
+        if self.punishments_cursor is not None:
+            if self.punishments_cursor.active_ban(uid) is not None:
+                return True
+        row = self.user_cursor.uid_query(uid)
+        return bool(row) and row[0][4] == "banned"
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         now = time.time()
@@ -1043,6 +1055,8 @@ class InstantConnect():
                     verified_uid = message.get('uid') if verified else None
             if verified_uid is None:
                 raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
+            if await to_thread(self._is_fully_banned, verified_uid):
+                raise ValueError("账号已被完全封禁：{}".format(verified_uid))
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
                 became_online = not self.connected_clients.get(verified_uid)
