@@ -640,7 +640,7 @@
 返回体：如果激活成功返回时间戳加 `True`，否则返回时间戳加 `False`。
 
 验证码在 `/auth/register` 返回时就已写入服务端（只是邮件发送是异步的），
-所以注册成功后可以立刻调用本接口。
+所以注册成功后可以立刻调用本接口。新验证码有效期为 15 分钟，激活与重置密码分别使用各自的验证码。
 
 - `POST /auth/resend_activation` 重发激活验证码
 
@@ -652,8 +652,8 @@
 }
 ```
 
-用于注册邮件没送达（SMTP 失败、邮箱写错后重新注册等）的情况。只有仍处于
-`banned`（即待激活）的账号会真正重发；已激活账号直接返回成功。
+用于注册邮件未送达或验证码过期的情况。待激活账号（`pending`）会收到验证码，
+有效期内重发会使用当前验证码。已激活账号直接返回成功，封禁账号返回失败。
 
 返回体：验证码已生成并开始发送时返回时间戳加 `True`；凭据错误、账号不存在、
 服务器未启用邮箱验证或发信队列已满时返回时间戳加 `False`。
@@ -677,7 +677,7 @@
 
 验证码字段的选用取决于服务器的 `captcha_provider`（可从 `/info` 获取）：
 
-- `image`（默认）：传入 `captcha_stamp` 和 `captcha_code`。`captcha_stamp` 请填写 `/auth/captcha` 返回体中的 `stamp`；该值实际返回为整数时间戳，服务端校验时会将其转为整数处理。图片验证码**一次性有效**：无论校验是否通过，该 `stamp` 都会立即作废，客户端必须重新调用 `/auth/captcha` 获取新验证码后才能重试。
+- `image`（默认）：传入 `captcha_stamp` 和 `captcha_code`。`captcha_stamp` 请填写 `/auth/captcha` 返回体中的整数标识 `stamp`。图片验证码**一次性有效**：无论校验是否通过，该 `stamp` 都会立即作废，客户端必须重新调用 `/auth/captcha` 获取新验证码后才能重试。
 - 第三方（`turnstile` / `hcaptcha` / `recaptcha`）：传入 `captcha_token`，即 `/auth/captcha/page` 渲染页回调返回的 token。
 
 验证码校验失败（错误、过期或已使用）返回 `{"error": "captcha_invalid"}`（详细模式下为 `CAPTCHA_INVALID`，HTTP 400），客户端应重新获取验证码后重试。
@@ -686,7 +686,7 @@
 
 如果服务器不启用邮箱激活，`<email>` 是可以省略的。
 
-注册成功返回时间戳加 True，否则返回时间戳加 False。需注意如果要邮箱验证，用户初始状态为 `banned`。
+注册成功返回时间戳加 True，否则返回时间戳加 False。启用邮箱验证时，用户初始状态为 `pending`。
 
 **注册开关**：实例配置 `allow_register`（默认 `true`，可从 `/info` 读取）为 `false` 时，
 该端点返回 `{"error": "register_disabled"}`（详细模式下为 `REGISTER_DISABLED`，HTTP 403），
