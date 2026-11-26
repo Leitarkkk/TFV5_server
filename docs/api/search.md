@@ -7,9 +7,11 @@
 所有搜索接口都有**按 uid 的内存限流**（默认每 10 秒最多 20 次），超出返回 `{"success": false, "error": "rate_limited"}`（detail_error 模式下为 `RATE_LIMITED`）。
 关键词长度不得小于服务器配置 `min_search_length`（默认 2），过短返回 `search_keyword_too_short`（`VALIDATION_SEARCH_KEYWORD_TOO_SHORT`）。
 
+**UID / GID 关键词不受长度限制。**。
+
 ---
 
-- `^ POST /user/search` 按用户名搜索用户。
+- `^ POST /user/search` 按用户名搜索用户；`keyword` 为纯数字或 `U<uid>` 时按 UID 精确查找。
 
 请求体：
 
@@ -37,10 +39,17 @@
 - 结果中**不包含 email**。
 - 排除封禁用户（`stat == "banned"`）与当前用户自己。
 - 匹配为大小写不敏感的模糊匹配，`%` 与 `_` 会被转义为字面量。
+- **UID 精确查找**：`keyword` 为纯数字或 `U<uid>`（`u` 也可）时，先按 `uid` 精确匹配，
+  命中返回该用户（数组只含一项），**不受 `min_search_length` 限制**。
+  - 带 `U` 前缀仅搜索用户
+  - 纯数字未命中时会继续按用户名模糊搜索（用户名本身可能就是一串数字）
+  - 精确查找**不排除自己**（按 UID 就是定位该账号）
+    按用户名模糊搜索则继续排除自己
+  - 不搜索封禁
 
 ---
 
-- `^ POST /group/search` 按群名搜索群组（分页）；`keyword` 为纯数字时按 GID 精确查找。
+- `^ POST /group/search` 按群名搜索群组（分页）；`keyword` 为纯数字或 `G<gid>` 时按 GID 精确查找。
 
 请求体：
 

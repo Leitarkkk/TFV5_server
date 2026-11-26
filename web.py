@@ -5576,26 +5576,52 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/user/search", methods=['POST'])
     def user_search(req):
-        """按用户名搜索用户。返回 uid/username/sign"""
+        """按用户名搜索用户"""
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
+
+        raw_keyword = str(req.get("keyword") or "").strip()
+        # U114514
+        uid_token = raw_keyword
+        explicit_uid = False
+        if len(raw_keyword) > 1 and raw_keyword[0] in ("U", "u"):
+            candidate = raw_keyword[1:]
+            if candidate.isascii() and candidate.isdigit() and len(candidate) <= 18:
+                uid_token = candidate
+                explicit_uid = True
+
+        target_uid = None
+        if uid_token.isascii() and uid_token.isdigit() and len(uid_token) <= 18:
+            target_uid = int(uid_token)
+
         keyword, limit, _offset, err = normalize_search_request(
-            req.get("keyword"), read_config().get("min_search_length", 2),
+            uid_token if target_uid is not None else raw_keyword,
+            0 if target_uid is not None else read_config().get("min_search_length", 2),
             req.get("limit", 20),
         )
         if err:
             return json.dumps({"success": False, "error": err})
+
+        if target_uid is not None:
+            # 按 UID 查找不排除自己
+            hit = user_cursor.lookup_by_uid(target_uid)
+            if hit is not None:
+                return json.dumps([hit], ensure_ascii=False)
+            # 带 U 前缀
+            if explicit_uid:
+                return json.dumps([], ensure_ascii=False)
+
         results = user_cursor.search_users(keyword, limit=limit, exclude_uid=uid)
         return json.dumps(results, ensure_ascii=False)
 
     @api("/group/search", methods=['POST'])
     def group_search(req):
         """按群名搜索群组（分页）
-        纯数字关键词按 GID 精确查找
+        纯数字或 `G<gid>` 关键词按 GID 精确查找
         """
         uid = req["uid"]
         password = req["password"]
@@ -5605,12 +5631,20 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "rate_limited"})
 
         raw_keyword = str(req.get("keyword") or "").strip()
+        gid_token = raw_keyword
+        explicit_gid = False
+        if len(raw_keyword) > 1 and raw_keyword[0] in ("G", "g"):
+            candidate = raw_keyword[1:]
+            if candidate.isascii() and candidate.isdigit() and len(candidate) <= 18:
+                gid_token = candidate
+                explicit_gid = True
+
         gid = None
-        if raw_keyword.isascii() and raw_keyword.isdigit() and len(raw_keyword) <= 18:
-            gid = int(raw_keyword)
+        if gid_token.isascii() and gid_token.isdigit() and len(gid_token) <= 18:
+            gid = int(gid_token)
 
         keyword, limit, offset, err = normalize_search_request(
-            raw_keyword,
+            gid_token if gid is not None else raw_keyword,
             0 if gid is not None else read_config().get("min_search_length", 2),
             req.get("limit", 20), req.get("offset", 0),
         )
@@ -5621,6 +5655,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if hit is not None:
                 return json.dumps(
                     {"success": True, "groups": [hit], "has_more": False},
+                    ensure_ascii=False,
+                )
+            # 带 G
+            if explicit_gid:
+                return json.dumps(
+                    {"success": True, "groups": [], "has_more": False},
                     ensure_ascii=False,
                 )
 

@@ -119,6 +119,25 @@ class UserDb(Db):
         """
         return self.query("SELECT * FROM users WHERE email = ?",  (email,))
 
+    def lookup_by_uid(self, uid):
+        """按 UID 精确查
+        """
+        if isinstance(uid, bool):
+            return None
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return None
+        rows = self.query(
+            "SELECT uid, username, sign FROM users "
+            "WHERE uid = ? AND stat != 'banned'",
+            (uid,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {"uid": row[0], "username": row[1], "sign": row[2] or ""}
+
     def search_users(self, keyword: str, limit: int = 20, exclude_uid=None):
         """按用户名搜索（前缀匹配优先，回退模糊），排除封禁用户
         """
