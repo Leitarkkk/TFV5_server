@@ -474,12 +474,40 @@ class InstantConnect():
             finally:
                 self._cleanup_client(websocket)
 
-    def notify_user(self, uid : int, notification : dict):
+    def _deliver_notification(self, uid : int, record : dict,
+                              event_type : str = "NOTIFICATION.NEW"):
+        if self.loop is None:
+            return
+        with self._clients_lock:
+            clients = list(self.connected_clients.get(uid, []))
+        for websocket in clients:
+            asyncio.run_coroutine_threadsafe(
+                self._queue_message(websocket, {"type" : event_type, "notification" : record}),
+                self.loop
+            )
+
+    @staticmethod
+    def _ephemeral_record(notification : dict, time_stamp : float) -> dict:
+        """瞬时通知推送记录"""
+        return {
+            "id" : -1,
+            "time_stamp" : time_stamp,
+            "read_at" : None,
+            "info" : notification
+        }
+
+    def notify_user(self, uid : int, notification : dict, ephemeral : bool = False):
         """推送系统事件通知
 
         消息事件不再使用，请使用 push_message / push_messages
+
+        ephemeral=True 时只做实时推送
         """
         notification = dict(notification)
+        if ephemeral:
+            record = self._ephemeral_record(notification, time.time())
+            self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return record
         stored = self.notification_cursor.add_event(uid, notification)
         record = {
             "id" : stored["id"],
@@ -487,32 +515,28 @@ class InstantConnect():
             "read_at" : None,
             "info" : notification
         }
-        if self.loop is None:
-            return record
-        with self._clients_lock:
-            clients = list(self.connected_clients.get(uid, []))
-        for websocket in clients:
-            asyncio.run_coroutine_threadsafe(
-                self._queue_message(websocket, {"type" : "NOTIFICATION.NEW", "notification" : record}),
-                self.loop
-            )
+        self._deliver_notification(uid, record)
         return record
 
-    def notify_users(self, uid_notifications) -> list:
+    def notify_users(self, uid_notifications, ephemeral : bool = False) -> list:
         """批量写入系统事件通知并推送给各自已连接的客户端
 
         :param uid_notifications: [(uid, notification), ...]
+        :param ephemeral: 只推送
         :return: [{id, time_stamp, read_at, info}, ...]
         """
         if not uid_notifications:
             return []
         prepared = [(int(uid), dict(notification)) for uid, notification in uid_notifications]
+        if ephemeral:
+            now = time.time()
+            records = []
+            for index, (uid, notification) in enumerate(prepared):
+                record = self._ephemeral_record(notification, now + index * 1e-6)
+                records.append(record)
+                self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return records
         stored = self.notification_cursor.add_events(prepared)
-        with self._clients_lock:
-            client_map = {
-                uid: list(self.connected_clients.get(uid, []))
-                for uid, _ in prepared
-            }
         records = []
         for (uid, notification), meta in zip(prepared, stored):
             record = {
@@ -522,13 +546,7 @@ class InstantConnect():
                 "info" : notification
             }
             records.append(record)
-            if self.loop is None:
-                continue
-            for websocket in client_map.get(uid, []):
-                asyncio.run_coroutine_threadsafe(
-                    self._queue_message(websocket, {"type" : "NOTIFICATION.NEW", "notification" : record}),
-                    self.loop
-                )
+            self._deliver_notification(uid, record)
         return records
 
     def push_message(self, uid : int, message : dict):
