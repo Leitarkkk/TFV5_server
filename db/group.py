@@ -4,6 +4,35 @@ import time
 
 
 GROUP_MEMBERS_MIGRATION = "group_members_v1"
+JOIN_POLICY_MIGRATION = "group_join_policy_v1"
+
+# 加入策略：
+# - open          允许自由加入：任何人可直接加入
+# - approval      允许审批加入：任何人可申请，管理员审批
+# - invite        仅允许邀请：任一成员可邀请，被邀请者直接入群
+# - admin_invite  仅允许管理员邀请：只有群主/管理员能邀请
+JOIN_POLICIES = ("open", "approval", "invite", "admin_invite")
+DEFAULT_JOIN_POLICY = "approval"
+
+
+JOIN_POLICY_COMPAT = {
+    "open": (1, 0),
+    "approval": (1, 1),
+    "invite": (0, 0),
+    "admin_invite": (0, 1),
+}
+
+
+def policy_compat_columns(policy):
+    """兼容值"""
+    return JOIN_POLICY_COMPAT.get(policy, JOIN_POLICY_COMPAT[DEFAULT_JOIN_POLICY])
+
+
+def legacy_policy(allow_direct_join, require_review):
+    """旧库迁移"""
+    if allow_direct_join:
+        return "open" if not require_review else "approval"
+    return "invite" if not require_review else "admin_invite"
 
 
 class GroupDb(Db):
@@ -32,7 +61,9 @@ class GroupDb(Db):
                 allow_direct_join INTEGER NOT NULL DEFAULT 0,
                 require_review INTEGER NOT NULL DEFAULT 1,
                 essence TEXT,
-                public_messages INTEGER NOT NULL DEFAULT 0
+                public_messages INTEGER NOT NULL DEFAULT 0,
+                searchable INTEGER NOT NULL DEFAULT 1,
+                join_policy TEXT NOT NULL DEFAULT 'approval'
             )
         """)
         self.execute("""
@@ -107,6 +138,28 @@ class GroupDb(Db):
             return []
         return self._parse_essence(row[0][0])
 
+    def remove_essence_many(self, gid, mids) -> set:
+        """批量遗精"""
+        targets = {int(m) for m in (mids or []) if m is not None}
+        if not targets:
+            return set()
+
+        with self.lock:
+            def _remove_many():
+                self.cursor.execute("SELECT essence FROM groups WHERE gid = ?", (gid,))
+                row = self.cursor.fetchone()
+                if not row:
+                    return set()
+                essence_list = self._parse_essence(row[0])
+                kept = [m for m in essence_list if m not in targets]
+                if len(kept) == len(essence_list):
+                    return set()
+                removed = set(essence_list) - set(kept)
+                self.cursor.execute("UPDATE groups SET essence = ? WHERE gid = ?", (json.dumps(kept), gid))
+                self.conn.commit()
+                return removed
+            return self._execute_with_retry(_remove_many)
+
     def _migrate(self):
         try:
             self.execute("ALTER TABLE groups ADD COLUMN allow_direct_join INTEGER NOT NULL DEFAULT 0")
@@ -132,6 +185,18 @@ class GroupDb(Db):
             self.execute("ALTER TABLE join_requests ADD COLUMN message TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
+        try:
+            self.execute("ALTER TABLE groups ADD COLUMN searchable INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            self.execute(
+                "ALTER TABLE groups ADD COLUMN join_policy TEXT NOT NULL DEFAULT '{}'".format(
+                    DEFAULT_JOIN_POLICY
+                )
+            )
+        except Exception:
+            pass
         self.execute("""
             CREATE TABLE IF NOT EXISTS group_members (
                 gid INTEGER NOT NULL,
@@ -152,6 +217,42 @@ class GroupDb(Db):
             )
         """)
         self._migrate_legacy_members()
+        # 依赖 schema_migrations 表
+        self._migrate_join_policy()
+
+    def _migrate_join_policy(self):
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT 1 FROM schema_migrations WHERE name = ?",
+                    (JOIN_POLICY_MIGRATION,),
+                )
+                if self.cursor.fetchone() is not None:
+                    return False
+                self.cursor.execute(
+                    "SELECT gid, allow_direct_join, require_review FROM groups"
+                )
+                updates = []
+                for gid, allow_direct_join, require_review in self.cursor.fetchall():
+                    policy = legacy_policy(
+                        bool(allow_direct_join), bool(require_review)
+                    )
+                    allow, review = policy_compat_columns(policy)
+                    updates.append((policy, allow, review, gid))
+                if updates:
+                    self.cursor.executemany(
+                        "UPDATE groups SET join_policy = ?, allow_direct_join = ?,"
+                        " require_review = ? WHERE gid = ?",
+                        updates,
+                    )
+                self.cursor.execute(
+                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                    (JOIN_POLICY_MIGRATION, time.time()),
+                )
+                self.conn.commit()
+                return True
+
+            return self._execute_with_retry(operation)
 
     def _migrate_legacy_members(self):
         with self.lock:
@@ -253,10 +354,44 @@ class GroupDb(Db):
             results.append(r)
         return results
 
+    _PUBLIC_SELECT = """SELECT g.gid, g.groupname, g.introduction,
+                      (SELECT COUNT(*) FROM group_members gm WHERE gm.gid = g.gid) AS member_count,
+                      g.allow_direct_join, g.require_review, g.public_messages,
+                      g.searchable, g.join_policy
+               FROM groups g"""
+
+    @staticmethod
+    def _public_dict(row) -> dict:
+        policy = row[8] or DEFAULT_JOIN_POLICY
+        return {
+            "gid": row[0],
+            "groupname": row[1],
+            "introduction": row[2] or "",
+            "member_count": row[3],
+            "allow_direct_join": bool(row[4]),
+            "require_review": bool(row[5]),
+            "public_messages": bool(row[6]),
+            "searchable": bool(row[7]) if row[7] is not None else True,
+            "join_policy": policy,
+        }
+
+    def lookup_by_gid(self, gid):
+        if isinstance(gid, bool):
+            # True 会被 int() 转成 1，误命中 gid=1
+            return None
+        try:
+            gid = int(gid)
+        except (TypeError, ValueError):
+            return None
+        rows = self.query(
+            self._PUBLIC_SELECT + " WHERE g.gid = ? AND g.searchable = 1", (gid,)
+        )
+        return self._public_dict(rows[0]) if rows else None
+
     def search_public(self, keyword: str, limit: int = 20, offset: int = 0):
         """按群名搜索，仅返回公开字段
 
-        返回 (groups, has_more)，groups 为 dict 列表。
+        返回 (groups, has_more)
         """
         escaped = (
             keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -264,29 +399,15 @@ class GroupDb(Db):
         prefix = escaped + "%"
         contains = "%" + escaped + "%"
         rows = self.query(
-            """SELECT g.gid, g.groupname, g.introduction,
-                      (SELECT COUNT(*) FROM group_members gm WHERE gm.gid = g.gid) AS member_count,
-                      g.allow_direct_join, g.require_review, g.public_messages
-               FROM groups g
-               WHERE g.groupname LIKE ? ESCAPE '\\'
+            self._PUBLIC_SELECT + """
+               WHERE g.searchable = 1 AND g.groupname LIKE ? ESCAPE '\\'
                ORDER BY CASE WHEN g.groupname LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
                         g.gid ASC
                LIMIT ? OFFSET ?""",
             (contains, prefix, limit + 1, offset),
         )
         has_more = len(rows) > limit
-        groups = [
-            {
-                "gid": r[0],
-                "groupname": r[1],
-                "introduction": r[2] or "",
-                "member_count": r[3],
-                "allow_direct_join": bool(r[4]),
-                "require_review": bool(r[5]),
-                "public_messages": bool(r[6]),
-            }
-            for r in rows[:limit]
-        ]
+        groups = [self._public_dict(r) for r in rows[:limit]]
         return groups, has_more
 
     def get_member_uids(self, gid: int) -> list:
@@ -339,7 +460,8 @@ class GroupDb(Db):
     def get_group_settings(self, gid: int) -> dict:
         row = self.query(
             """SELECT gid, creater, groupname, enter_hint, introduction,
-                      allow_direct_join, require_review, essence_enabled, public_messages
+                      allow_direct_join, require_review, essence_enabled, public_messages,
+                      searchable, join_policy
                FROM groups WHERE gid = ?""",
             (gid,),
         )
@@ -352,6 +474,8 @@ class GroupDb(Db):
             "allow_direct_join": bool(r[5]), "require_review": bool(r[6]),
             "essence_enabled": bool(r[7]) if r[7] is not None else True,
             "public_messages": bool(r[8]) if r[8] is not None else False,
+            "searchable": bool(r[9]) if r[9] is not None else True,
+            "join_policy": r[10] or DEFAULT_JOIN_POLICY,
         }
 
     def get_essence_enabled(self, gid: int) -> bool:
@@ -377,10 +501,19 @@ class GroupDb(Db):
         ]
 
     def create_group(self, creater: int, groupname: str, enter_hint: str,
-                     introduction: str, allow_direct_join: bool = False,
-                     require_review: bool = True) -> int:
+                     introduction: str, allow_direct_join=None,
+                     require_review=None, join_policy: str = None,
+                     searchable: bool = True) -> int:
         cfg = self._config_reader()
         limit = cfg.get("groups_limit", 30)
+        if join_policy not in JOIN_POLICIES:
+            if allow_direct_join is None and require_review is None:
+                join_policy = DEFAULT_JOIN_POLICY
+            else:
+                join_policy = legacy_policy(
+                    bool(allow_direct_join), bool(require_review)
+                )
+        allow_direct_join, require_review = policy_compat_columns(join_policy)
 
         with self.lock:
             def operation():
@@ -391,10 +524,12 @@ class GroupDb(Db):
                 gid = self.cursor.lastrowid
                 self.cursor.execute(
                     """INSERT INTO groups (gid, creater, groupname,
-                       enter_hint, introduction, allow_direct_join, require_review, essence)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       enter_hint, introduction, allow_direct_join, require_review,
+                       essence, join_policy, searchable)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (gid, creater, groupname, enter_hint, introduction,
-                     int(allow_direct_join), int(require_review), "[]"),
+                     int(allow_direct_join), int(require_review), "[]",
+                     join_policy, int(bool(searchable))),
                 )
                 self.cursor.execute(
                     "INSERT INTO group_members (gid, uid, role, join_time) VALUES (?, ?, 2, ?)",
@@ -512,10 +647,17 @@ class GroupDb(Db):
     def update_settings(self, gid: int, **kwargs) -> bool:
         allowed = {"groupname", "enter_hint", "introduction",
                    "allow_direct_join", "require_review", "essence_enabled",
-                   "public_messages"}
+                   "public_messages", "searchable", "join_policy"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
+        if "join_policy" in updates:
+            policy = updates["join_policy"]
+            if policy not in JOIN_POLICIES:
+                return False
+            allow, review = policy_compat_columns(policy)
+            updates["allow_direct_join"] = allow
+            updates["require_review"] = review
         if "allow_direct_join" in updates:
             updates["allow_direct_join"] = int(updates["allow_direct_join"])
         if "require_review" in updates:
@@ -524,6 +666,8 @@ class GroupDb(Db):
             updates["essence_enabled"] = int(updates["essence_enabled"])
         if "public_messages" in updates:
             updates["public_messages"] = int(updates["public_messages"])
+        if "searchable" in updates:
+            updates["searchable"] = int(updates["searchable"])
         set_clause = ", ".join("{} = ?".format(k) for k in updates)
         self.execute(
             "UPDATE groups SET {} WHERE gid = ?".format(set_clause),

@@ -65,6 +65,7 @@ class LoginQueueTests(unittest.IsolatedAsyncioTestCase):
         self.expires_at = int(time.time()) + 60
         users = Mock()
         users.get_auth_version.side_effect = self._get_auth_version
+        users.uid_query.return_value = []
         with patch("channel.crypto.load_pri"), patch.object(InstantConnect, "_start_cleanup_thread"):
             self.hub = InstantConnect(7000, 7001, Mock(), users, Mock(), Mock(),
                                       jwt_secret="test", jwt_key_store=Mock())

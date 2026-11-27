@@ -1,6 +1,7 @@
 from flask import Flask, send_file, redirect, request as flask_request, g as flask_g
 from flask import render_template_string, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
+import functools
 import json
 import register_tool
 import captcha_service
@@ -12,6 +13,8 @@ import hmac
 import ipaddress
 import re
 from db import *
+from db.group import JOIN_POLICIES
+from db.punishments import PUNISHMENT_KINDS
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
     USERS_COL_SHOW_READ_STATUS,
@@ -302,6 +305,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 row = user_cursor.uid_query(uid)
                 if not row:
                     return False, {"error": "auth_failed"}
+                rejected = _full_ban_rejection(int(uid))
+                if rejected is not None:
+                    return False, rejected
                 identity = {"uid": int(uid), "stat": row[0][4]}
                 flask_g.auth_identity = identity
                 return True, (identity, True)
@@ -314,6 +320,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         row = user_cursor.uid_query(uid)
         if not row:
             return False, {"error": "auth_failed"}
+        rejected = _full_ban_rejection(int(uid))
+        if rejected is not None:
+            return False, rejected
         identity = {"uid": int(uid), "stat": row[0][4]}
         flask_g.auth_identity = identity
         return True, (identity, True)
@@ -337,8 +346,29 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         return response
 
-    api = return_app_route(app, pri, resolve_auth,
-                           feature_checker=lambda path: feature_gate(read_config(), *path))
+    _route_api = return_app_route(
+        app, pri, resolve_auth,
+        feature_checker=lambda path: feature_gate(read_config(), *path))
+
+    def api(*args, **kwargs):
+        """
+        写入检查
+        """
+        route = _route_api(*args, **kwargs)
+        path = args[0] if args else kwargs.get("path", "")
+
+        def decorator(func):
+            @functools.wraps(func)
+            def guarded(req, *a, **kw):
+                blocked = _readonly_write_block(req.get("uid"), path)
+                if blocked is not None:
+                    return json.dumps({"success": False, "error": blocked})
+                return func(req, *a, **kw)
+
+            return route(guarded)
+
+        return decorator
+
     limiter = RateLimiter(port_api)
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "pending", "admin", "root"}
@@ -353,20 +383,108 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return None
         return punishments_cursor.active_ban(uid)
 
+    def _full_ban_rejection(uid):
+        """完全封禁连读都不允许。
+
+        本地/外部 JWT 由 `auth_version` 保证（封禁时 bump 会立刻失效），
+        但 legacy（uid+password）认证不校验版本，必须在这里补一道，
+        否则完全封禁的账号可以继续用密码读接口。
+        """
+        if _active_ban(uid) is not None:
+            return {"error": "account_banned"}
+        return None
+
     def _content_block(uid, user_stat):
         if user_stat == "pending":
             return "pending_activation"
         if user_stat == "banned":
-            return "account_banned"
+            _sweep_legacy_ban(uid)
+            row = user_cursor.uid_query(uid)
+            user_stat = row[0][4] if row else user_stat
+            if user_stat == "banned":
+                return "account_banned"
         punishment = punishments_cursor.active_restriction(uid) \
             if punishments_cursor is not None else None
         if punishment is None:
             return None
         kind = punishment[2]
-        if kind == "ban":
+        if kind == "ban_full":
             return "account_banned"
+        if kind == "ban":
+            # 只读封禁：能登录、能浏览，但内容写入一律拒绝
+            return "account_readonly"
         if kind == "mute":
             return "account_muted"
+        return None
+
+    # 写入路径
+    _READONLY_BLOCKED_PATHS = frozenset({
+        # 消息与会话设置
+        "/message/send", "/message/redirect", "/message/recall",
+        "/chat/preferences/update",
+        # 好友关系
+        "/friend/add_friend", "/friend/deal_ship",
+        "/friend/block", "/friend/unblock",
+        # 群
+        "/group/create_group", "/group/update_settings", "/group/delete_group",
+        "/group/join", "/group/invite", "/group/invite_member",
+        "/group/handle_join_request", "/group/leave", "/group/remove_member",
+        "/group/add_admin", "/group/remove_admin", "/group/transfer_owner",
+        "/group/pin_message", "/group/unpin_message",
+        "/group/add_essence", "/group/remove_essence",
+        # 论坛
+        "/forum/create_forum", "/forum/edit_forum", "/forum/remove_forum",
+        "/forum/send_post", "/forum/comment", "/forum/remove_post",
+        "/forum/remove_comment", "/forum/join", "/forum/leave",
+        "/forum/add_member", "/forum/remove_member",
+        "/forum/change_member_role", "/forum/pin_post", "/forum/unpin_post",
+        "/forum/approve_forum", "/forum/reject_forum",
+        # 自身信息
+        "/auth/change_pwd", "/auth/change_email", "/auth/change_email_verify",
+        "/auth/change_sign", "/auth/change_introduction",
+        "/auth/change_privacy", "/auth/change_public_email",
+        "/auth/change_captcha", "/auth/change_rate_limits",
+        "/auth/devices/update_label", "/auth/devices/revoke",
+        "/auth/sessions/rename", "/auth/sessions/revoke",
+        "/auth/sessions/revoke_all", "/auth/tokens/revoke",
+        "/auth/platform/bind", "/auth/platform/unbind",
+        "/auth/external/bind", "/auth/external/unbind",
+        # 头像
+        "/avatar/upload_user_avatar", "/avatar/upload_forum_avatar",
+        "/avatar/upload_group_avatar", "/avatar/upload_logo",
+        "/avatar/upload_default_avatar",
+        # 文件
+        "/file/upload_file", "/file/chunked_upload", "/file/instant_upload",
+        "/file/delete_file", "/file/dereference_file",
+        # 贴图
+        "/sticker/upload",
+        "/sticker/item/create", "/sticker/item/delete", "/sticker/item/reorder",
+        "/sticker/pack/create", "/sticker/pack/delete", "/sticker/pack/update",
+        "/sticker/ownership", "/sticker/ownership/reorder",
+        # 管理操作
+        "/auth/manage/ban", "/auth/manage/unban",
+        "/auth/manage/create", "/auth/manage/delete",
+        "/auth/manage/update", "/auth/manage/signing_keys/rotate",
+        "/auth/change_auth", "/auth/server_settings/update",
+        "/punishment/create", "/punishment/revoke", "/ticket/handle",
+        "/announcement/upload_announcement", "/announcement/edit_announcement",
+        "/announcement/delete_announcement",
+        "/file/admin_force_delete_file",
+    })
+
+    def _readonly_write_block(uid, path):
+        if uid is None or path not in _READONLY_BLOCKED_PATHS:
+            return None
+        if punishments_cursor is None:
+            return None
+        restriction = punishments_cursor.active_restriction(uid)
+        if restriction is None:
+            return None
+        kind = restriction[2]
+        if kind == "ban_full":
+            return "account_banned"
+        if kind == "ban":
+            return "account_readonly"
         return None
     locks = {
         'config': threading.Lock(),
@@ -544,14 +662,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             print("[WARN] 创建通知表失败(uid={}): {}".format(target_uid, e))
             return False
 
-    def notify_user(target_uid : int, event : str, title : str, content : str, sender=None, meta=None):
+    def notify_user(target_uid : int, event : str, title : str, content : str, sender=None, meta=None, ephemeral=False):
         def callback():
             if not user_cursor.uid_query(target_uid):
                 return None
-            return instant_contact.notify_user(target_uid, build_notification(event, title, content, sender, meta))
+            return instant_contact.notify_user(
+                target_uid,
+                build_notification(event, title, content, sender, meta),
+                ephemeral=ephemeral,
+            )
         return run_notification_side_effect("notify_user/{}".format(event), callback)
 
-    def notify_users(target_uids, event : str, title : str, content : str, sender=None, meta=None):
+    def notify_users(target_uids, event : str, title : str, content : str, sender=None, meta=None, ephemeral=False):
         def callback():
             unique = normalize_notification_targets(target_uids)
             if not unique:
@@ -570,7 +692,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     (uid, dict(notification)) for uid in batch if uid in existing
                 ]
                 if prepared:
-                    records.extend(instant_contact.notify_users(prepared))
+                    records.extend(
+                        instant_contact.notify_users(prepared, ephemeral=ephemeral)
+                    )
             return records
         records = run_notification_side_effect("notify_users/{}".format(event), callback)
         if records is None:
@@ -599,9 +723,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 _config_stat = None
             apply_request_body_limit(_config_cache)
             apply_proxy_fix(_config_cache)
-            # WS 侧的功能开关与限额是启动时的快照：配置一落地就同步刷新，
-            # 否则管理端关掉 presence/read_receipt 后 HTTP 已经 403，
-            # WS 仍在推 presence.update / message.read_receipt。
             instant_contact.refresh_config()
             return dict(_config_cache)
 
@@ -687,14 +808,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 entry.get("iss") for entry in (cfg.get("jwt_external_issuers") or [])
                 if isinstance(entry, dict) and isinstance(entry.get("iss"), str) and entry.get("iss")
             ],
-            # 客户端据此发现"去哪里做外部登录"。空串 = 未启用。
             "external_auth_url" : (
                 cfg.get("external_auth_url", "").strip().rstrip("/")
                 if isinstance(cfg.get("external_auth_url"), str) else ""
             ),
             "platform_auth_enabled" : bool(cfg.get("platform_auth_enabled", False)),
-            # 认证平台支持的第三方登录方式，由服务器代拉取后下发（60s 缓存）。
-            # 客户端据此渲染 GitHub 等按钮，无需自己访问认证平台。
+            # 认证平台支持的第三方登录方式，由服务器代拉取后下发
             "external_auth_providers" : external_auth_providers.providers(
                 cfg.get("external_auth_url") if isinstance(cfg.get("external_auth_url"), str) else ""
             ),
@@ -717,7 +836,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ret["smtp_use_ssl"] = cfg.get("smtp_use_ssl", True)
             ret["reverse_proxy_enabled"] = cfg.get("reverse_proxy_enabled", False)
             ret["proxy_count"] = cfg.get("proxy_count", 1)
-            # 平台端点的非敏感项直接回显；共享令牌与 SMTP 密码同理，只回显"是否已配置"
+            # 平台端点的非敏感项
             ret["platform_auth_issuer"] = (
                 cfg.get("platform_auth_issuer", "").strip().rstrip("/")
                 if isinstance(cfg.get("platform_auth_issuer"), str) else ""
@@ -1002,7 +1121,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if meta and not meta.get("size") and oss_store.is_oss_enabled(port_api):
             meta["size"] = oss_store.get_size_from_oss(port_api, "file", file_hash)
         if meta and file_hash:
-            # 惰性自愈：新文件缺媒体元数据 / pending 卡住时重新入队
+            # 惰性自愈
             file.ensure_media(port_api, file_hash, file_cursor)
         return meta
 
@@ -1057,7 +1176,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "fid": row[0], "pid": row[1], "title": row[2],
                 "creater": row[3], "author_uid": row[3],
                 "content": row[4], "send_time": row[5],
-                # 列表卡片直接展示，客户端不必再为每张卡片单独拉评论
+                # 列表卡片直接展示
                 "comment_count": int(summary.get("count") or 0),
                 "last_comment": summary.get("last"),
             }
@@ -1094,8 +1213,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def clean_deleted_user_state(target_uid : int):
         target_uid = int(target_uid)
-        # 会话状态（已读水位 / 房间偏好 / @ 提及）随账号一起清掉；
-        # 消息行保留，避免破坏对方的聊天历史。
         messages_cursor.purge_user_state(target_uid)
         user_groups = group_cursor.get_user_group_rows(target_uid)
         owned_gids = [row[0] for row in group_cursor.query_creater(target_uid)]
@@ -1152,7 +1269,24 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         cleanup_forum_queue(target_uid)
         return True
 
+    STAT_BAN_REASON = "账号状态被管理员设为封禁"
+
+    def _ensure_stat_ban(uid, operator_uid):
+        if punishments_cursor is None:
+            return True, None
+        if punishments_cursor.active_ban(uid) is not None:
+            return True, None
+        punishment_id = punishments_cursor.create(
+            uid, "ban_full", STAT_BAN_REASON, operator_uid
+        )
+        if not punishment_id:
+            return False, None
+        return True, punishment_id
+
     def perform_managed_auth_change(uid : int, pwd : str, target_uid : int, new_auth : str):
+        """只改角色"""
+        if new_auth not in {"user", "admin", "root"}:
+            return False
         operator = verify_manager(uid, pwd)
         if operator is None:
             return False
@@ -1160,26 +1294,86 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         target = resolve_managed_target(operator[4], target_uid, next_auth=new_auth)
         if target is None:
             return False
+        if target[4] == "banned":
+            return False
 
         if not user_cursor.update_user_with_root_guard(target_uid, stat=new_auth):
             return False
 
+        user_cursor.bump_auth_version(target_uid)
         if not run_critical_side_effect(
             "disconnect_user", lambda: instant_contact.disconnect_user(target_uid)
         ):
             return False
+        notify_user(target_uid, "auth.stat.changed", "账号状态已变更",
+                    "你的账号状态已更新为 {}。".format(new_auth),
+                    sender=uid, meta={"new_auth": new_auth})
+        return True
 
-        notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
+    def perform_managed_ban(uid : int, pwd : str, target_uid : int):
+        """
+        完全封禁
+        """
+        operator = verify_manager(uid, pwd)
+        if operator is None:
+            return False
+        target = resolve_managed_target(operator[4], target_uid, next_auth="banned")
+        if target is None:
+            return False
+
+        ok, created_ban = _ensure_stat_ban(target_uid, operator[0])
+        if not ok:
+            return False
+        if not user_cursor.update_user_with_root_guard(target_uid, stat="banned"):
+            if created_ban:
+                punishments_cursor.revoke(created_ban, operator[0])
+            return False
+
+        user_cursor.bump_auth_version(target_uid)
+        if not run_critical_side_effect(
+            "disconnect_banned_user",
+            lambda: instant_contact.disconnect_user(target_uid)
+        ):
+            return False
+
+        notify_user(target_uid, "auth.stat.changed", "账号状态已变更",
+                    "你的账号已被封禁。", sender=uid, meta={"new_auth": "banned"})
+        return True
+
+    def perform_managed_unban(uid : int, pwd : str, target_uid : int):
+        """
+        解封
+        """
+        operator = verify_manager(uid, pwd)
+        if operator is None:
+            return False
+        target = resolve_managed_target(operator[4], target_uid)
+        if target is None:
+            return False
+
+        if punishments_cursor is not None:
+            now = time.time()
+            for row in punishments_cursor.list_for_user(target_uid):
+                if row[2] != "ban_full" or row[7] is not None:
+                    continue
+                if row[6] is not None and row[6] <= now:
+                    continue
+                punishments_cursor.revoke(row[0], operator[0])
+
+        if target[4] == "banned":
+            if not user_cursor.update_user_with_root_guard(target_uid, stat="user"):
+                return False
+
+        user_cursor.bump_auth_version(target_uid)
+        notify_user(target_uid, "punishment.revoked", "封禁已解除",
+                    "你的账号封禁已被解除，可以重新登录。", sender=uid)
         return True
     
-    # ---- 外部认证平台（TouchFish Auth）专用准入 ----
-    # 该组端点只服务于服务端到服务端的调用：
-    #   IP/CIDR 白名单（remote_addr 已经过 ProxyFix）
-    #   + 可选共享令牌（防 X-Forwarded-For 伪造绕过白名单）
+    # 外部认证平台（TouchFish Auth）!!!!
+    # 由 YWD2023 强力驱动
     PLATFORM_PREFIX = "/auth/platform/"
 
     def platform_issuer(cfg=None):
-        """平台端点只接受一个 issuer：显式配置优先，否则取唯一的外部签发方。"""
         cfg = read_config() if cfg is None else cfg
         value = cfg.get("platform_auth_issuer")
         if isinstance(value, str) and value.strip():
@@ -1221,11 +1415,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return True
 
     def warn_platform_security():
-        """平台端点开了却没配共享令牌时给出显著警告。
-
-        此时只靠 IP 白名单，而 reverse_proxy_enabled=true 后 remote_addr 来自
-        X-Forwarded-For，可被伪造 —— 等于把 bind/unbind/status 暴露给任意人。
-        启动时调用一次（read_config 已定义，可安全调用）。
+        """
+        平台端点警告
         """
         try:
             cfg = read_config()
@@ -1304,7 +1495,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @app.route("/.well-known/jwks.json")
     @app.route("/.well-known/jwks")
     def get_jwks():
-        """本服 JWT 公钥集（外部平台据此独立验签，无需共享 jwt_secret）。"""
+        """本服 JWT 公钥集"""
         cfg = read_config()
         if not cfg.get("jwt_jwks_enabled", True):
             return _wellknown_response({"error": "not_found"}, status=404)
@@ -1317,16 +1508,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route("/.well-known/openid-configuration")
     def get_openid_configuration():
-        """只声明验签所需元数据，不声明尚未实现的 authorize/token 端点。"""
+        """只声明验签所需元数据"""
         cfg = read_config()
         if (not cfg.get("jwt_discovery_enabled", True)
                 or not cfg.get("jwt_jwks_enabled", True)):
-            # 没有可用的 JWKS 时，不发布指向 404 的 discovery 元数据
+            # 没有可用的 JWKS
             return _wellknown_response({"error": "not_found"}, status=404)
         issuer = jwt_issuer(cfg)
         if not (isinstance(issuer, str) and issuer.startswith(("http://", "https://"))):
-            # jwt_issuer 未配置时它只是端口号字符串，不是合法 issuer。
-            # 与其发布一个错的 issuer 让人误配，不如不发布。
             return _wellknown_response({
                 "error": "issuer_not_configured",
                 "detail": "jwt_issuer 必须是绝对的 http(s) URL，例如 https://fish.example.com",
@@ -1372,7 +1561,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def login_with_jwt(uid, pwd, device_id=None, device_name=None, platform=0):
         """
-        JWT 登录：校验凭据后签发 access token 并建立可刷新 Session。
+        JWT 登录
         """
         if not verify_user(uid, pwd):
             return {"error": "auth_failed"}
@@ -1380,14 +1569,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if row and row[0][4] == "pending":
             # 独立错误码：客户端据此跳激活页，而不是显示"账号被封禁"
             return {"error": "pending_activation"}
+        if row and row[0][4] == "banned":
+            # 封禁以处罚表为准；users.stat='banned' 只用于兼容历史数据
+            _sweep_legacy_ban(uid)
+            row = user_cursor.uid_query(uid)
         if _active_ban(uid) is not None or (row and row[0][4] == "banned"):
             return {"error": "account_banned"}
         return create_session_for_user(uid, device_id, device_name, platform)
 
     def create_session_for_user(uid, device_id=None, device_name=None, platform=0):
         """
-        为已通过身份校验的用户签发本地会话（access + refresh）。
-        超限（jwt_max_per_user）时吊销最老的会话。
+        为已通过身份校验的用户签发本地会话（access + refresh）
         """
         cfg = read_config()
         max_sessions = int(cfg.get("jwt_max_per_user", 5))
@@ -1474,13 +1666,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
          revoked_at, _ip, _ua, _device_id, _location) = row
         if revoked_at is not None or expires_at <= now:
             return {"error": "auth_failed"}
-        # 封禁必须能打断续期：只拦登录的话，封禁前建立的会话
-        # 可以靠 refresh 一直续下去（默认 7 天），等于没封。
-        account = get_user_row(uid)
-        if account is None:
-            return {"error": "auth_failed"}
-        if account[4] == "banned" or _active_ban(uid) is not None:
+        if _active_ban(uid) is not None:
             return {"error": "account_banned"}
+        refresh_row = user_cursor.uid_query(uid)
+        if refresh_row and refresh_row[0][4] == "banned":
+            _sweep_legacy_ban(uid)
+            refresh_row = user_cursor.uid_query(uid)
+            if refresh_row and refresh_row[0][4] == "banned":
+                return {"error": "account_banned"}
         auth_version = user_cursor.get_auth_version(uid)
 
         new_refresh_token = secrets.token_hex(32)
@@ -1512,7 +1705,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def verify_external_identity(external_token):
         """
-        验证外部签发的 JWT（jwt_external_issuers 配置）。返回 (payload, issuer_cfg)；失败 (None, None)。
+        验证外部签发的 JWT
         """
         if not isinstance(external_token, str) or not external_token:
             return None, None
@@ -1522,7 +1715,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         payload = jwt_tool.verify_external_token(external_token, external_issuers)
         if payload is None:
             return None, None
-        # 只接受 TFV5 token，第三方 OAuth token无法使用（来源于 https://github.com/ILoveScratch2/TouchFish-Auth ）
+        # 只接受 TFV5 token
+        # 第三方 OAuth token无法使用（来源于 https://github.com/ILoveScratch2/TouchFish-Auth ）
         token_use = payload.get("token_use")
         if token_use not in (None, "tfv5"):
             return None, None
@@ -1537,7 +1731,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def build_external_username(payload, sub):
         """
-        自动建号用户名：claim username/preferred_username 优先，otherwise ext_<sub>
+        自动建号用户名
         """
         candidate = None
         for claim in ("username", "preferred_username"):
@@ -1554,7 +1748,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def auto_create_external_user(payload, sub):
         """
-        外部身份自动建号（随机密码，仅能经外部平台登录）。返回新 uid 或 None。
+        外部身份自动建号（随机密码，仅能经外部平台登录）
         """
         candidate = build_external_username(payload, sub)
         email = payload.get("email")
@@ -1583,8 +1777,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/external/login", methods=["POST"])
     def external_login(req):
         """
-        用外部平台签发的 JWT 换取本地会话（access + refresh）。
-        默认要求外部身份已绑定本地账号；issuer 配置 allow_auto_create 开启时可自动建号。
+        用外部平台 JWT 换取本地会话（access + refresh）
         """
         payload, issuer_cfg = verify_external_identity(req.get("external_token"))
         if payload is None:
@@ -1610,6 +1803,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {"error": "external_token_invalid"}
         if row[0][4] in _BLOCKED_STATS:
             return {"error": "user_banned"}
+        if _content_block(uid, row[0][4]) == "account_banned":
+            return {"error": "user_banned"}
         return create_session_for_user(
             uid, req.get("device_id"), req.get("device_name"), req.get("platform", 0)
         )
@@ -1617,7 +1812,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/external/bind", methods=["POST"])
     def external_bind(req):
         """
-        将外部平台身份绑定到当前本地账号（需本地会话）。
+        将外部平台身份绑定到当前本地账号
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1641,7 +1836,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/external/unbind", methods=["POST"])
     def external_unbind(req):
         """
-        解绑当前账号在指定 issuer 下的外部身份。
+        解绑当前账号在指定 issuer 下的外部身份
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1656,7 +1851,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/external/list", methods=["POST"])
     def external_list(req):
         """
-        列出当前账号已绑定的外部身份。
+        列出当前账号已绑定的外部身份
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1669,8 +1864,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def _resolve_session_target(req, identity):
         """
-        解析会话管理请求的目标用户与当前会话 id。
-        返回 (uid, current_sid) 或 (None, None)（错误时由调用方判断）。
+        解析会话管理请求的目标用户与当前会话 id
         """
         uid = identity["uid"]
         current_sid = identity.get("sid")
@@ -1690,7 +1884,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/sessions/list", methods=["POST"])
     def list_auth_sessions(req):
         """
-        列出当前用户的活跃会话（session 粒度）。
+        列出当前用户的活跃会话
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1723,7 +1917,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/sessions/revoke", methods=["POST"])
     def revoke_auth_session(req):
         """
-        按 session_id 吊销指定会话（踢出设备）。
+        按 session_id 吊销指定会话（踢出设备
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1749,7 +1943,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/sessions/revoke_all", methods=["POST"])
     def revoke_all_other_sessions(req):
         """
-        吊销除当前会话外的全部会话（管理员可吊销目标用户全部会话）。
+        吊销除当前会话外的全部会话
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1759,7 +1953,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {"error": "forbidden"}
         target_uid = req.get("target_uid")
         if target_uid is not None:
-            # 管理员操作目标用户：吊销其全部会话
+            # 管理员操作目标用户
             user_cursor.revoke_sessions(uid)
             if not run_critical_side_effect(
                 "disconnect_user_owner",
@@ -1767,7 +1961,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ):
                 return {"error": "unavailable"}
             return {"success": True}
-        # 普通用户：吊销除当前会话外的全部会话
+        # 普通用户
         disconnect_failed = False
         for session_id, *_rest in user_cursor.list_sessions(uid):
             if session_id == current_sid:
@@ -1816,8 +2010,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/tokens/list", methods=["POST"])
     def list_auth_tokens(req):
         """
-        [deprecated] 列出活跃会话，兼容旧字段名（tokens 视图，会话粒度）。
-        新客户端请使用 /auth/sessions/list。
+        [deprecated] 请使用 /auth/sessions/list
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1846,8 +2039,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/tokens/revoke", methods=["POST"])
     def revoke_auth_token(req):
         """
-        [deprecated] 按 session_id 吊销会话（兼容旧 jti 字段）。
-        新客户端请使用 /auth/sessions/revoke。
+        [deprecated] 请使用 /auth/sessions/revoke
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1873,7 +2065,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/logout", methods=["POST"])
     def logout_current_token(req):
         """
-        登出：吊销当前请求所使用的会话（若有），并断开该设备的 WebSocket。
+        登出
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
@@ -1962,9 +2154,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/validate", methods=["POST"])
     def validate_token(req):
-        """
-        仅 JWT 路径的会话探活：验证 token 有效性并返回身份
-        """
         identity = flask_g.get("auth_identity")
         if identity is None or "auth_version" not in identity:
             return {"error": "not_authenticated"}
@@ -1975,8 +2164,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/query_self", methods=["POST"])
     def query_self(req):
-        """查自己的完整资料
-        """
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
@@ -2005,7 +2192,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "public_email": public_email_visible(row),
             "show_read_status": show_read_status_visible(row),
             "show_online_status": show_online_status_visible(row),
-            # 当前生效的禁言/封禁，客户端据此提前告知用户，而不是等提交失败
+            # 当前生效的禁言/封禁
             "restriction": restriction,
         }, ensure_ascii=False)
 
@@ -2031,7 +2218,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         captcha = cfg.get("captcha", False)
         if not captcha:
             return {}
-        # 第三方验证码走 /auth/captcha/page，此端点仅服务图片验证码
+        # 此端点仅服务图片验证码
         if captcha_service.is_third_party(cfg.get("captcha_provider", "image")):
             return {}
         token = register_tool.generate_captcha(port_api, ImgCaptcha, locks['captcha'])
@@ -2096,6 +2283,32 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "personal_sign" : info[0][6],
             "introduction" : info[0][7]
         }
+        return ret
+
+    @app.route("/auth/uids")
+    def query_uids():
+        """批量取用户公开信息
+        """
+        raw = flask_request.args.get("uids", "")
+        uids = []
+        for token in raw.split(","):
+            token = token.strip()
+            if token.isdigit() and len(uids) < 100:
+                uids.append(token)
+        ret = {}
+        for uid in uids:
+            info = user_cursor.uid_query(uid)
+            if not len(info):
+                continue
+            ret[uid] = {
+                "uid": info[0][0],
+                "username": info[0][1],
+                "email": info[0][2] if public_email_visible(info[0]) else "",
+                "stat": info[0][4],
+                "create_time": info[0][5],
+                "personal_sign": info[0][6],
+                "introduction": info[0][7]
+            }
         return ret
 
     @app.route("/auth/username/<username>")
@@ -2189,8 +2402,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/resend_activation", methods=["POST"])
     def resend_activation(req):
-        """重发激活验证码
-        """
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
@@ -2214,7 +2425,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/forgot_password", methods=["POST"])
     def forgot_password(req):
-        """忘记密码：向用户注册邮箱发送验证码（复用邮箱验证配置）。"""
         email = req.get("email")
         if not isinstance(email, str) or not email:
             return bool_res()[False]
@@ -2239,7 +2449,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/reset_password", methods=["POST"])
     def reset_password(req):
-        """忘记密码：验证邮箱验证码后重置密码，并吊销该用户全部 token。"""
         email = req.get("email")
         activate_code = req.get("activate_code")
         new_pwd = req.get("new_pwd")
@@ -2290,6 +2499,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             operator = verify_manager(uid, pwd)
             if operator is None:
                 return bool_res()[False]
+            if new_auth == "banned":
+                return bool_res()[False]
             if not can_manage_auth(operator[4], new_auth):
                 return bool_res()[False]
             cfg = read_config()
@@ -2339,6 +2550,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if target is None:
                 return bool_res()[False]
 
+            if next_auth == "banned":
+                return bool_res()[False]
+            if next_auth is not None and target[4] == "banned":
+                # 被封禁账号先解封
+                return bool_res()[False]
             updates = collect_managed_updates(req, next_auth=next_auth)
             if not updates:
                 return bool_res()[False]
@@ -2354,6 +2570,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 return bool_res()[False]
 
             if "password" in updates or next_auth is not None:
+                user_cursor.bump_auth_version(target_uid)
                 if not run_critical_side_effect(
                     "disconnect_user",
                     lambda: instant_contact.disconnect_user(target_uid)
@@ -2372,7 +2589,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             target_uid = req["change_uid"]
-            return bool_res()[perform_managed_auth_change(uid, pwd, target_uid, "banned")]
+            return bool_res()[perform_managed_ban(uid, pwd, target_uid)]
+        except Exception:
+            return bool_res()[False]
+
+    @api("/auth/manage/unban", methods=["POST"])
+    def manage_unban_user(req):
+        """解封：撤销完全封禁处罚"""
+        try:
+            uid = req["uid"]
+            pwd = req["password"]
+            target_uid = req["change_uid"]
+            return bool_res()[perform_managed_unban(uid, pwd, target_uid)]
         except Exception:
             return bool_res()[False]
 
@@ -2399,8 +2627,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             user_cursor.delete_tokens(target_uid)
 
-            # 断连失败必须让调用方知道：账号已从 DB 删除，
-            # 但残留的 WS 连接还能继续收发消息。
             if not run_critical_side_effect(
                 "disconnect_deleted_user",
                 lambda: instant_contact.disconnect_user(target_uid)
@@ -2507,13 +2733,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/change_privacy", methods=["POST"])
     def change_privacy(req):
-        """修改隐私开关（已读状态、在线状态）。
-
-        成功仍按 bool 约定回 `True`（与 change_pwd / change_sign 一致），但
-        拒绝改成 JSON 错误对象：这里是三种完全不同的失败（鉴权、字段类型、
-        一个字段都没给），压成同一个 `False` 会让客户端无法分辨，也只能靠
-        `detail_error` 协商拿到规范化错误码。未声明 detail_error 的老客户端
-        由 crypto.legacy_failure_body 降级回原来的纯文本 `False`，行为不变。
+        """修改隐私开关（已读状态、在线状态）
         """
         uid = req["uid"]
         password = req["password"]
@@ -2534,7 +2754,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             changed["show_online_status"] = value
         if not changed:
             return json.dumps({"success": False, "error": "invalid_request"})
-        # 单用户多端同步：隐私开关变更静默推给该用户所有在线端
+        # 单用户多端同步
         try:
             payload = {"type": "PRIVACY.UPDATED"}
             payload.update(changed)
@@ -2603,7 +2823,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "/auth/register": {"requests": 5,  "range": 300}
             }
         }
-        传入 null 可清空所有速率限制。
+        传入 null 可清空所有速率限制
         """
         uid = req["uid"]
         pwd = req["password"]
@@ -2835,9 +3055,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 current.update(updates)
             cfg = update_config(_apply)
             # 重新加载 ws
-            # 无条件刷新，避免只有部分键变更时才生效的遗漏
-            instant_contact._load_config(cfg)
-            # 反代配置变更时重新包装 wsgi 中间件
             if "reverse_proxy_enabled" in updates or "proxy_count" in updates:
                 apply_proxy_fix(cfg)
             return json.dumps(serialize_server_settings(cfg, include_manage=True), ensure_ascii=False)
@@ -2847,8 +3064,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/manage/signing_keys/list", methods=["POST"])
     def list_signing_keys(req):
         """
-        列出本服 JWT 签名密钥（root）。
-        返回的 kid/algorithm 与 /.well-known/jwks.json 中的公钥一一对应。
+        列出本服 JWT 签名密钥
         """
         try:
             uid = req.get("uid")
@@ -2869,11 +3085,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/auth/manage/signing_keys/rotate", methods=["POST"])
     def rotate_signing_key(req):
         """
-        轮换 JWT 签名密钥（root）。
-
-        默认同时把 jwt_signing_algorithm 切到新算法（activate=true）：
-        旧密钥在保留期内仍可验签并继续出现在 JWKS 中，存量 token 不会立即失效。
-        activate=false 只改密钥、不改配置；新钥仍会成为该算法的 active 签发钥。
+        轮换 JWT 签名密钥
         """
         try:
             uid = req.get("uid")
@@ -3091,14 +3303,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def info():
         return serialize_server_settings(read_config())
 
-    # ---- 外部认证平台专用端点 ----
-    # 这三个端点只登记"谁绑了谁"，刻意不创建本地会话：
-    # 绑定是纯校验 + 写映射，不应该占用用户的 jwt_max_per_user 配额，
-    # 更不应该因超限吊销用户最老的会话。
 
     @api("/auth/platform/bind", methods=["POST"])
     def platform_bind(req):
-        """校验 TouchFish 凭据并建立 (iss, sub) -> uid 映射。不建会话、不发 token。"""
         cfg = read_config()
         iss = platform_issuer(cfg)
         if not iss:
@@ -3148,7 +3355,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/platform/unbind", methods=["POST"])
     def platform_unbind(req):
-        """按 (iss, sub) 解绑。不 bump auth_version，避免踢掉用户所有设备。"""
         cfg = read_config()
         iss = platform_issuer(cfg)
         if not iss or req.get("iss") != iss:
@@ -3165,7 +3371,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route("/auth/platform/status")
     def platform_status():
-        """明文只读：平台据此判断绑定是否仍然有效，避免自己维护副本。"""
         cfg = read_config()
         iss = platform_issuer(cfg)
         sub = flask_request.args.get("sub", "")
@@ -3202,7 +3407,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return bool(rows and rows[0][4] in manager_auths)
 
     def _read_blob_head(kind, hashes, length=4096):
-        """读取 blob 的 (总大小, 头部字节)"""
+        """读取 blob 的 (总大小, 头部字节"""
         if not is_valid_file_hash(hashes):
             return None
         target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
@@ -3217,7 +3422,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return None
 
     def _read_blob_bytes(kind, hashes):
-        """完整读取 blob 内容（仅用于 ≤10MB 的 gzip/tgs 嗅探回退）。"""
+        """完整读取 blob 内容"""
         if not is_valid_file_hash(hashes):
             return None
         target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
@@ -3316,7 +3521,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         pack_id, slug, file_hash = req.get("pack_id"), req.get("slug"), req.get("file_hash")
         if sticker_cursor is None or not verify_user(uid, password) or not all(isinstance(value, str) and value for value in (pack_id, slug, file_hash)):
             return json.dumps({"success": False, "error": "invalid_request"})
-        # 贴图文件现由 sticker.db 独立管理；兼容旧的 file 上传渠道
+        # 贴图文件现由 sticker.db 独立管理
         sticker_managed = sticker_cursor.has_active_user_sticker(uid, file_hash)
         if not sticker_managed and not file_cursor.has_active_user_file(uid, file_hash):
             return json.dumps({"success": False, "error": "file_not_owned"})
@@ -3685,8 +3890,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             except forum_cursor.dialect.DatabaseError:
                 pinned_pid = None
             return json.dumps({
-                # 只返回富化后的结构：此前 posts 与 post_rows 各带一份正文，
-                # 响应体直接翻倍。
                 "post_rows": serialize_post_rows(posts),
                 "pinned_pid": pinned_pid,
                 "has_more": has_more,
@@ -3897,12 +4100,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         # wyf 不准拉自己
         if target_uid == uid:
             return bool_res()[False]
-        # 角色只能授予 0（成员）/50（管理员），且必须低于操作者；100（论坛主）不可授予
+        # 角色只能授予 0（成员）/50（管理员），且必须低于操作者
+        # 100（论坛主）不可授予
         if role not in (0, 50) or role >= operator_role:
             return bool_res()[False]
         existing_role = forum_cursor.get_member_role(fid, target_uid)
         if existing_role is not None:
-            # 已是成员：不得通过拉人覆盖更高/同级角色
+            # 已是成员
             if existing_role >= operator_role:
                 return bool_res()[False]
             return bool_res()[forum_cursor.change_member_role(fid, target_uid, role)]
@@ -4084,8 +4288,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except (TypeError, ValueError):
             return bool_res()[False]
         forum_role = forum_cursor.get_member_role(fid, uid)
-        # 权限判断放进 delete_comment 的同一事务：先读作者、再单独删除的话，
-        # 中间那个窗口里评论可能已经被换作者/删掉（TOCTOU）。
         removed_creator = forum_cursor.delete_comment(
             fid, pid, time_stamp,
             can_delete=lambda creator: (
@@ -4107,8 +4309,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     _MAX_TICKET_ATTACHMENTS = 9
 
     def _parse_attachment_hashes(raw):
-        """校验并登记工单附件
-        """
         if raw is None:
             return [], None
         if not isinstance(raw, list):
@@ -4223,6 +4423,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         ticket_type = req.get("type")
         if ticket_type not in ("report", "consult", "appeal"):
             return {"success": False, "error": "invalid_ticket_type"}
+
+        # 只读封禁
+        restriction = (
+            punishments_cursor.active_restriction(uid)
+            if punishments_cursor is not None else None
+        )
+        # 而且为了防止你急眼我们有先进的频率限制
+        if restriction is not None and restriction[2] in ("ban", "ban_full"):
+            if ticket_type != "appeal":
+                return {"success": False, "error": "forbidden"}
+            if not check_rate_limit(uid, "ticket_appeal_banned", 1, 86400):
+                return {"success": False, "error": "rate_limited"}
+
         if not feature_gate(read_config(), "tickets", ticket_type):
             return {"success": False, "error": "ticket_type_disabled"}
 
@@ -4529,7 +4742,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return {"success": True}
 
 
-    _PUNISHMENT_KIND_LABELS = {"warn": "警告", "mute": "禁言", "ban": "封禁"}
+    _PUNISHMENT_KIND_LABELS = {
+        "warn": "警告",
+        "mute": "禁言",
+        "ban": "封禁（只读）",
+        "ban_full": "完全封禁",
+    }
     _PUNISHMENT_NOTICE = {
         "warn": ("你收到一条警告",
                  "处罚类型：警告。理由：{reason}。"
@@ -4537,10 +4755,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         "mute": ("你已被禁言",
                  "处罚类型：禁言。理由：{reason}。"
                  "禁言期间无法发送消息、发帖和评论，仍可提交工单申诉。"),
-        "ban": ("你的账号已被封禁",
-                "处罚类型：封禁。理由：{reason}。"
-                "封禁期间无法登录，如认为有误可联系管理员申诉。"),
+        "ban": ("你的账号已被封禁为只读",
+                "处罚类型：封禁（只读）。理由：{reason}。"
+                "你无法发送消息、发帖、加好友或修改资料，"
+                "只能提交申诉类工单（限制 1 天仅可提交 1 次）。"),
+        "ban_full": ("你的账号已被完全封禁",
+                     "处罚类型：完全封禁。理由：{reason}。"
+                     "封禁期间无法登录，如认为有误可通过申诉渠道联系管理员。"),
     }
+
+    def _sweep_legacy_ban(uid):
+        """
+        清理历史遗留 users.stat='banned'
+        """
+        row = user_cursor.uid_query(uid)
+        if not row or row[0][4] != "banned":
+            return
+        if _active_ban(uid) is not None:
+            return
+        user_cursor.change_auth(uid, "user")
+        notify_user(uid, "punishment.expired", "处罚已到期",
+                    "你的封禁已到期，账号已恢复正常。")
 
     @api("/punishment/create", methods=["POST"])
     def punishment_create(req):
@@ -4555,7 +4790,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except (KeyError, TypeError, ValueError):
             return bool_res()[False]
         kind = req.get("kind")
-        if kind not in ("warn", "mute", "ban"):
+        if kind not in PUNISHMENT_KINDS:
             return {"success": False, "error": "invalid_kind"}
         reason = req.get("reason")
         if not isinstance(reason, str) or not reason.strip():
@@ -4585,6 +4820,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not punishment_id:
             return bool_res()[False]
 
+        if kind == "ban_full":
+            user_cursor.bump_auth_version(target_uid)
+            run_critical_side_effect(
+                "disconnect_banned_user",
+                lambda: instant_contact.disconnect_user(target_uid),
+            )
+
         # 不写 users.stat
         kind_label = _PUNISHMENT_KIND_LABELS.get(kind, kind)
         notice_title, notice_body = _PUNISHMENT_NOTICE.get(
@@ -4611,6 +4853,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if target_uid != uid and not _is_manager(uid):
             return bool_res()[False]
+        _sweep_legacy_ban(target_uid)
         rows = punishments_cursor.list_for_user(target_uid)
         now = time.time()
         items = []
@@ -4642,6 +4885,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         punishments_cursor.revoke(punishment_id, uid)
 
         target_uid = row[1]
+        _sweep_legacy_ban(target_uid)
         notify_user(target_uid, "punishment.revoked", "处罚已解除",
                     "你的一条处罚已被解除。", sender=uid,
                     meta={"punishment_id": punishment_id})
@@ -5099,13 +5343,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         download_name = metadata.get("file_name") or hashes
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 不要传 content_type
+                # 类型由对象元数据决定
                 url = oss_store.presigned_download_url(
                     port_api, "file", hashes, download_name,
-                    content_type=mime_from_name(download_name),
                 )
                 if url:
                     return redirect(url, code=307)
-        # OSS2 模式（代理模式）：先从 OSS 拉取到唯一临时文件，发送完成后立即删除
+        # OSS2 模式（代理模式）
         if oss_store.is_oss_enabled(port_api):
             temp_path = oss_store.temp_download_path(port_api, "file", hashes)
             try:
@@ -5118,7 +5363,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     mimetype=mime_from_name(download_name),
                     max_age=FILE_CACHE_MAX_AGE,
                 )
-                # 发送完成后立即删除本地临时文件（带重试，避免 WinError 32）
+                # 发送完成后立即删除本地临时文件
                 @resp.call_on_close
                 def _cleanup_temp():
                     oss_store.safe_remove(temp_path)
@@ -5143,15 +5388,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if media is None or media["status"] != "done":
             return ("", 404)
         if media["thumb_is_original"]:
-            # 原图不超过缩略图规格：直接复用原图
+            # 原图不超过缩略图规格
             return get_file(hashes)
         if not media["thumb_size"]:
             return ("", 404)
         download_name = "{}.thumb.webp".format(hashes)
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 同上：不 response-content-type 覆盖
                 url = oss_store.presigned_download_url(
-                    port_api, "thumb", hashes, download_name, content_type="image/webp")
+                    port_api, "thumb", hashes, download_name)
                 if url:
                     return redirect(url, code=307)
             temp_path = oss_store.temp_download_path(port_api, "thumb", hashes)
@@ -5260,9 +5506,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         if oss_store.is_oss_enabled(port_api):
             if oss_store.get_download_mode(port_api) == "redirect":
+                # 同上：不 response-content-type 覆盖
                 url = oss_store.presigned_download_url(
                     port_api, "sticker", hashes, download_name,
-                    content_type=mimetype_map.get(ext),
                 )
                 if url:
                     return redirect(url, code=307)
@@ -5370,8 +5616,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         enter_hint = req.get("enter_hint", "")
         allow_direct_join = bool(req.get("allow_direct_join", False))
         require_review = bool(req.get("require_review", True))
+        allow_direct_join = req.get("allow_direct_join")
+        require_review = req.get("require_review")
+        join_policy = req.get("join_policy")
+        searchable = bool(req.get("searchable", True))
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
+        if join_policy is not None and join_policy not in JOIN_POLICIES:
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_row = get_user_row(uid)
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
@@ -5384,7 +5636,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(groupname, str) or not (min_len <= len(groupname.strip()) <= max_len):
             return json.dumps({"success": False, "error": "invalid_request"})
         gid = group_cursor.create_group(uid, groupname, enter_hint, introduction,
-                                        allow_direct_join, require_review)
+                                        allow_direct_join=allow_direct_join,
+                                        require_review=require_review,
+                                        join_policy=join_policy,
+                                        searchable=searchable)
         if gid:
             return json.dumps({"gid": gid})
         return json.dumps({"success": False, "error": "unavailable"})
@@ -5408,37 +5663,94 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/user/search", methods=['POST'])
     def user_search(req):
-        """按用户名搜索用户。返回 uid/username/sign"""
+        """按用户名搜索用户"""
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
+
+        raw_keyword = str(req.get("keyword") or "").strip()
+        # U114514
+        uid_token = raw_keyword
+        explicit_uid = False
+        if len(raw_keyword) > 1 and raw_keyword[0] in ("U", "u"):
+            candidate = raw_keyword[1:]
+            if candidate.isascii() and candidate.isdigit() and len(candidate) <= 18:
+                uid_token = candidate
+                explicit_uid = True
+
+        target_uid = None
+        if uid_token.isascii() and uid_token.isdigit() and len(uid_token) <= 18:
+            target_uid = int(uid_token)
+
         keyword, limit, _offset, err = normalize_search_request(
-            req.get("keyword"), read_config().get("min_search_length", 2),
+            uid_token if target_uid is not None else raw_keyword,
+            0 if target_uid is not None else read_config().get("min_search_length", 2),
             req.get("limit", 20),
         )
         if err:
             return json.dumps({"success": False, "error": err})
+
+        if target_uid is not None:
+            # 按 UID 查找不排除自己
+            hit = user_cursor.lookup_by_uid(target_uid)
+            if hit is not None:
+                return json.dumps([hit], ensure_ascii=False)
+            # 带 U 前缀
+            if explicit_uid:
+                return json.dumps([], ensure_ascii=False)
+
         results = user_cursor.search_users(keyword, limit=limit, exclude_uid=uid)
         return json.dumps(results, ensure_ascii=False)
 
     @api("/group/search", methods=['POST'])
     def group_search(req):
-        """按群名搜索群组（分页）"""
+        """按群名搜索群组（分页）
+        纯数字或 `G<gid>` 关键词按 GID 精确查找
+        """
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
+
+        raw_keyword = str(req.get("keyword") or "").strip()
+        gid_token = raw_keyword
+        explicit_gid = False
+        if len(raw_keyword) > 1 and raw_keyword[0] in ("G", "g"):
+            candidate = raw_keyword[1:]
+            if candidate.isascii() and candidate.isdigit() and len(candidate) <= 18:
+                gid_token = candidate
+                explicit_gid = True
+
+        gid = None
+        if gid_token.isascii() and gid_token.isdigit() and len(gid_token) <= 18:
+            gid = int(gid_token)
+
         keyword, limit, offset, err = normalize_search_request(
-            req.get("keyword"), read_config().get("min_search_length", 2),
+            gid_token if gid is not None else raw_keyword,
+            0 if gid is not None else read_config().get("min_search_length", 2),
             req.get("limit", 20), req.get("offset", 0),
         )
         if err:
             return json.dumps({"success": False, "error": err})
+        if gid is not None and offset == 0:
+            hit = group_cursor.lookup_by_gid(gid)
+            if hit is not None:
+                return json.dumps(
+                    {"success": True, "groups": [hit], "has_more": False},
+                    ensure_ascii=False,
+                )
+            # 带 G
+            if explicit_gid:
+                return json.dumps(
+                    {"success": True, "groups": [], "has_more": False},
+                    ensure_ascii=False,
+                )
+
         groups, has_more = group_cursor.search_public(keyword, limit=limit, offset=offset)
         return json.dumps(
             {"success": True, "groups": groups, "has_more": has_more},
@@ -5490,6 +5802,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "require_review": settings["require_review"],
             "public_messages": settings["public_messages"],
             "essence_enabled": settings["essence_enabled"],
+            # 加入策略与可搜索性
+            "join_policy": settings["join_policy"],
+            "searchable": settings["searchable"],
             "members": members,
         }
         if is_member:
@@ -5550,7 +5865,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not group_cursor.get_essence_enabled(gid):
             return bool_res()[False]
         message = messages_cursor.get_message(mid)
-        if message is None or message.get("group_id") != gid:
+        if (message is None or message.get("group_id") != gid
+                or message.get("deleted")):
             return bool_res()[False]
         succeed = group_cursor.add_essence(gid, mid)
         if not succeed:
@@ -5564,7 +5880,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         else:
             return bool_res()[False]
         if succeed: 
-            notify_users(target_uids, "group.essence.add", "{} 的消息被设定精华".format(group_name), "管理员 {} 将用户 {} 的消息设为精华".format(uid, sender), sender=uid, meta={"gid" : gid})
+            notify_users(target_uids, "group.essence.add", "{} 的消息被设定精华".format(group_name), "管理员 {} 将用户 {} 的消息设为精华".format(uid, sender), sender=uid, meta={"gid" : gid}, ephemeral=True)
 
         return bool_res()[succeed]
 
@@ -5596,7 +5912,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         else:
             return bool_res()[False]
         if succeed: 
-            notify_users(target_uids, "group.essence.remove", "{} 的消息被移除精华".format(group_name), "管理员 {} 将用户 {} 的消息移除精华".format(uid, sender), sender=uid, meta={"gid" : gid})
+            notify_users(target_uids, "group.essence.remove", "{} 的消息被移除精华".format(group_name), "管理员 {} 将用户 {} 的消息移除精华".format(uid, sender), sender=uid, meta={"gid" : gid}, ephemeral=True)
         return bool_res()[succeed]
 
     @api("/group/query_essence", methods=['POST'])
@@ -5608,7 +5924,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "auth_failed"})
         if not group_cursor.is_member(gid, uid):
             return json.dumps({"success": False, "error": "not_group_member"})
-        return json.dumps({"essence" : group_cursor.query_essence(gid), "essence_enabled": group_cursor.get_essence_enabled(gid)})
+        mids = group_cursor.query_essence(gid)
+        # 惰性清理：修复本次改动前遗留的「已撤回但仍被标为精华」记录
+        stale = messages_cursor.recalled_mids(mids)
+        if stale:
+            group_cursor.remove_essence_many(gid, stale)
+            mids = [m for m in mids if m not in stale]
+        return json.dumps({"essence" : mids, "essence_enabled": group_cursor.get_essence_enabled(gid)})
 
     @api("/group/remove_member", methods=['POST'])
     def remove_member(req):
@@ -5785,9 +6107,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         updates = {}
         for key in ("groupname", "enter_hint", "introduction",
                      "allow_direct_join", "require_review", "essence_enabled",
-                     "public_messages"):
+                     "public_messages", "searchable", "join_policy"):
             if key in req:
                 updates[key] = req[key]
+        if "join_policy" in updates and updates["join_policy"] not in JOIN_POLICIES:
+            return bool_res()[False]
         if "groupname" in updates:
             cfg = read_config()
             min_len = cfg.get("min_group_name_length", 1)
@@ -5826,7 +6150,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             notify_users(member_uids, "messages.pinned",
                 "消息已置顶",
                 "{} 在群 {} 中置顶了一条消息。".format(format_user_display(uid), group_name),
-                sender=uid, meta={"gid": gid, "mid": mid, "pin_id": pin_id})
+                sender=uid, meta={"gid": gid, "mid": mid, "pin_id": pin_id}, ephemeral=True)
         return bool_res()[bool(pin_id)]
 
     @api("/group/unpin_message", methods=['POST'])
@@ -5850,7 +6174,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             notify_users(member_uids, "messages.unpinned",
                 "消息置顶已取消",
                 "{} 取消了群中的一条消息置顶。".format(format_user_display(uid)),
-                sender=uid, meta={"gid": gid, "pin_id": pin_id})
+                sender=uid, meta={"gid": gid, "pin_id": pin_id}, ephemeral=True)
         return bool_res()[succeeded]
 
     @api("/group/pinned_messages", methods=['POST'])
@@ -5939,25 +6263,26 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         request_message = str(req.get("message", "") or "").strip()
         if max_len > 0 and len(request_message) > max_len:
             return json.dumps({"success": False, "error": "request_message_too_long"})
-        if settings["allow_direct_join"]:
-            if not settings["require_review"]:
-                succeeded = group_cursor.add_member(gid, uid)
-                if succeeded:
-                    return json.dumps({"pending": False})
-                return json.dumps({"success": False, "error": "unavailable"})
-            else:
-                members = group_cursor.get_member_uids(gid)
-                cfg = read_config()
-                limit = cfg.get("single_group_max_people", 200)
-                if limit != -1 and len(members) >= limit:
-                    return json.dumps({"success": False, "error": "conflict"})
-                rid = group_cursor.request_join(gid, uid, message=request_message)
-                reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
-                run_notification_side_effect("group.join.request",
-                    lambda: notify_users(reviewers, "group.join.request",
-                        "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
-                        sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
-                return json.dumps({"rid": rid, "pending": True})
+        # 加入策略
+        policy = settings["join_policy"]
+        if policy == "open":
+            succeeded = group_cursor.add_member(gid, uid)
+            if succeeded:
+                return json.dumps({"pending": False})
+            return json.dumps({"success": False, "error": "unavailable"})
+        if policy == "approval":
+            members = group_cursor.get_member_uids(gid)
+            cfg = read_config()
+            limit = cfg.get("single_group_max_people", 200)
+            if limit != -1 and len(members) >= limit:
+                return json.dumps({"success": False, "error": "conflict"})
+            rid = group_cursor.request_join(gid, uid, message=request_message)
+            reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
+            run_notification_side_effect("group.join.request",
+                lambda: notify_users(reviewers, "group.join.request",
+                    "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
+            return json.dumps({"rid": rid, "pending": True})
         return json.dumps({"success": False, "error": "forbidden"})
 
     @api("/group/invite", methods=['POST'], feature=("chat", "group_chat"))
@@ -5988,27 +6313,33 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if max_len > 0 and len(invite_message) > max_len:
             return json.dumps({"success": False, "error": "request_message_too_long"})
         is_admin = group_cursor.is_admin(gid, uid) >= 1
-        if not settings["require_review"] or is_admin:
-            succeeded = group_cursor.add_member(gid, invited_uid)
-            if succeeded:
-                run_notification_side_effect("group.invited",
-                    lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
-                        "{} 邀请你加入群 {}。".format(format_user_display(uid), settings["groupname"]),
-                        sender=uid, meta={"gid": gid}))
-                return json.dumps({"pending": False})
-            return json.dumps({"success": False, "error": "unavailable"})
-        rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
-                                        message=invite_message)
-        reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
-        run_notification_side_effect("group.join.request",
-            lambda: notify_users(reviewers, "group.join.request",
-                "新的入群申请", "{} 邀请 {} 加入群 {}，等待审核。".format(format_user_display(uid), format_user_display(invited_uid), settings["groupname"]),
-                sender=uid, meta={"gid": gid, "rid": rid, "message": invite_message}))
-        run_notification_side_effect("group.invited.pending",
-            lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
-                "{} 邀请你加入群 {}（需审核）。".format(format_user_display(uid), settings["groupname"]),
-                sender=uid, meta={"gid": gid, "rid": rid}))
-        return json.dumps({"rid": rid, "pending": True})
+        policy = settings["join_policy"]
+        # 仅管理员邀请
+        if policy == "admin_invite" and not is_admin:
+            return json.dumps({"success": False, "error": "forbidden"})
+        # 审批加入
+        if policy == "approval" and not is_admin:
+            rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
+                                            message=invite_message)
+            reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
+            run_notification_side_effect("group.join.request",
+                lambda: notify_users(reviewers, "group.join.request",
+                    "新的入群申请", "{} 邀请 {} 加入群 {}，等待审核。".format(format_user_display(uid), format_user_display(invited_uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid, "message": invite_message}))
+            run_notification_side_effect("group.invited.pending",
+                lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
+                    "{} 邀请你加入群 {}（需审核）。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid, "rid": rid}))
+            return json.dumps({"rid": rid, "pending": True})
+        # open / invite / admin_invite(管理员) / approval(管理员)
+        succeeded = group_cursor.add_member(gid, invited_uid)
+        if succeeded:
+            run_notification_side_effect("group.invited",
+                lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
+                    "{} 邀请你加入群 {}。".format(format_user_display(uid), settings["groupname"]),
+                    sender=uid, meta={"gid": gid}))
+            return json.dumps({"pending": False})
+        return json.dumps({"success": False, "error": "unavailable"})
 
     @api("/group/join_requests", methods=['POST'])
     def join_requests(req):
@@ -6320,8 +6651,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 sender_notif["should_alert"] = False
                 instant_contact.push_message(target_uid, recv_notif)
                 instant_contact.push_message(uid, sender_notif)
-                # 发送即已读：隐式前进也要告诉对方，否则对方的推送通道会停在旧
-                # 水位（WS 路径同理，见 channel.emit_private_read_receipt）。
+                # 发送即已读
                 instant_contact.emit_private_read_receipt(
                     uid, target_uid, messages_cursor.room_key_of(uid, target_uid),
                     msg_record["mid"], msg_record.get("room_seq") or 0)
@@ -6340,7 +6670,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/message/redirect", methods=['POST'])
     def redirect_messages(req):
-        """合并转发：把同一房间内最多 100 条文本消息结为一条
+        """
+        合并转发
+        把同一房间内最多 100 条文本消息结为一条
         """
         try:
             uid = req["uid"]
@@ -6502,7 +6834,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/chat/list", methods=['POST'])
     def chat_list(req):
-        """返回所有聊天会话及最后一条消息和对方资料。"""
+        """返回所有聊天会话及最后一条消息和对方资料"""
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
@@ -6760,9 +7092,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "already_recalled"})
         if message.get("file_hash"):
             file_cursor.remove_reference(message["file_hash"], "message", mid)
-        # 撤回的若是群置顶消息，同步取消置顶，避免置顶残留
+        # 撤回的若是群置顶/精华消息，同步清理
         if message.get("group_id") is not None:
             messages_cursor.unpin_message_by_mid(mid, message["group_id"])
+            group_cursor.remove_essence(message["group_id"], mid)
 
         recalled = messages_cursor.get_message(mid)
         event = {
@@ -6867,6 +7200,77 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         records = messages_cursor.serialize_rows(rows)
         return json.dumps(enrich_message_files(records), ensure_ascii=False)
 
+    @api("/message/search", methods=['POST'])
+    def message_search(req):
+        """在单个会话内按关键词搜索历史消息
+        """
+        uid = req["uid"]
+        password = req["password"]
+        try:
+            has_target = req.get("target_uid") is not None
+            target_uid = int(req.get("target_uid", 0)) if has_target else 0
+            group_id = req.get("group_id")
+            before_mid = int(req.get("before_mid", 0))
+            if group_id is not None:
+                group_id = int(group_id)
+        except (ValueError, TypeError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        user_row = get_user_row(uid)
+        if user_row is None:
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if user_row[4] in _BLOCKED_STATS:
+            return json.dumps({"success": False, "error": "banned"})
+        if not check_search_rate(uid):
+            return json.dumps({"success": False, "error": "rate_limited"})
+
+        keyword, limit, _offset, err = normalize_search_request(
+            req.get("keyword"), read_config().get("min_search_length", 2),
+            req.get("limit", 20),
+        )
+        if err:
+            return json.dumps({"success": False, "error": err})
+
+        if group_id is not None:
+            if not group_cursor.is_member(group_id, uid):
+                settings = group_cursor.get_group_settings(group_id)
+                if not settings or not settings.get("public_messages"):
+                    return json.dumps({"success": False, "error": "not_group_member"})
+                limit = min(limit, 50)
+        elif has_target:
+            if not user_cursor.is_friend(uid, target_uid):
+                return json.dumps({"success": False, "error": "not_friends"})
+        else:
+            return json.dumps({"success": False, "error": "not_friends"})
+
+        before_mid = max(0, before_mid)
+        rows = messages_cursor.search_room_messages(
+            uid, target_uid, keyword,
+            before_mid=before_mid, limit=limit, group_id=group_id,
+        )
+        records = enrich_message_files(messages_cursor.serialize_rows(rows))
+        sender_uids = sorted({
+            record.get("sender_uid") for record in records
+            if record.get("sender_uid") is not None
+        })
+        if sender_uids:
+            placeholders = ",".join("?" * len(sender_uids))
+            name_rows = user_cursor.query(
+                "SELECT uid, username FROM users WHERE uid IN ({})".format(
+                    placeholders),
+                tuple(sender_uids),
+            )
+            name_map = {row[0]: row[1] for row in name_rows}
+            for record in records:
+                record["sender_name"] = name_map.get(record.get("sender_uid"))
+        return json.dumps({
+            "success": True,
+            "messages": records,
+            "has_more": len(records) >= limit,
+        }, ensure_ascii=False)
+
     @api("/message/sync", methods=['POST'])
     def message_sync(req):
         """增量同步某房间消息（含缺口补拉）。
@@ -6960,11 +7364,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/message/read_receipt", methods=['POST'], feature=("chat", "read_receipt"))
     def read_receipt(req):
-        """按需查询某条消息的已读情况（不推送、不持久化）。
-
-        请求体：room_id ("U<uid>" | "G<gid>")、mid。
-        私聊：返回对方是否已读到该消息（对方关闭已读则 hidden=true）。
-        群聊：返回「N 人已读」计数（成员 ∩ 非发送者 ∩ 未关闭已读，不暴露他人水位）。
+        """按需查询某条消息的已读情况
         """
         try:
             uid = int(req["uid"])
@@ -6996,15 +7396,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "success": True, "room_id": room_id, "mid": mid, "hidden": True,
                 }, ensure_ascii=False)
             state = messages_cursor.get_read_state(target_id, room_key)
-            peer_seq = state["last_read_seq"] if state else 0
             peer_mid = state["last_read_mid"] if state else 0
+            genuine_seq = state["genuine_seq"] if state else 0
             return json.dumps({
                 "success": True,
                 "room_id": room_id,
                 "mid": mid,
                 "hidden": False,
-                "read": peer_seq >= cursor[0],
-                "reader_last_seq": peer_seq,
+                "read": genuine_seq >= cursor[0],
+                "reader_last_seq": genuine_seq,
                 "reader_last_mid": peer_mid,
             }, ensure_ascii=False)
 
@@ -7040,11 +7440,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/friend/presence", methods=['POST'], feature=("presence",))
     def friend_presence(req):
-        """批量查询好友在线状态（不推送、不持久化）。
-
-        请求体：uid、password、可选 uids（缺省=全部好友）。
-        取「请求集合 ∩ 好友」，剔除已关闭在线状态的用户，返回 {"presence": {"<uid>": "online"|"offline"}}。
-        天然防止拿任意 uid 探测：非好友的 uid 不返回任何状态。
+        """批量查询好友在线状态
         """
         try:
             uid = int(req["uid"])
@@ -7077,7 +7473,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             for u in targets
             if flags.get(u, {}).get("show_online_status", True)
         }
-        return json.dumps({"success": True, "presence": presence}, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "presence": presence,
+            "ts": int(time.time() * 1000),
+        }, ensure_ascii=False)
 
     @api("/friend/add_friend", methods=['POST'], feature=("chat", "friend_request"))
     def add_friend(req):
@@ -7110,7 +7510,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/friend/requests", methods=['POST'])
     def friend_requests(req):
-        """查看发给当前用户的待处理好友申请（含最新留言）。"""
+        """查看发给当前用户的待处理好友申请（含最新留言）"""
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
@@ -7142,7 +7542,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if not user_cursor.set_blocked(uid, target, uid):
             return bool_res()[False]
-        # 双方可能残留的好友申请通知都不可再处理，清掉避免误导
+        # 双方可能残留的好友申请通知都不可再处理
         try:
             notification_cursor.delete_events_by_sender(uid, "friend.request", target)
             notification_cursor.delete_events_by_sender(target, "friend.request", uid)
@@ -7166,10 +7566,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/friend/relationship", methods=['POST'])
     def friend_relationship(req):
-        """查询「我」与目标的当前关系（含拉黑方向）。
-
-        资料页据此显示「拉黑」还是「解除拉黑」：`friend_blocked` 只在申请时告诉
-        我们「存在拉黑」，分不清是谁拉黑了谁。
+        """查询我与目标的当前关系
         """
         try:
             uid = int(req["uid"])
@@ -7205,7 +7602,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/friend/blocked", methods=['POST'])
     def blocked_list(req):
-        """我拉黑的人（「拉黑列表」用，可逐条解除）。"""
+        """我拉黑的人"""
         try:
             uid = int(req["uid"])
             password = req["password"]
@@ -7219,6 +7616,47 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "success": True,
             "blocked": user_cursor.list_blocked_by(uid),
         }, ensure_ascii=False)
+
+    FRIEND_ACCEPTED_GREETING = "已通过好友申请，现在可以开始 TouchFish 聊天了。"
+
+    def send_friend_accepted_greeting(accepter_uid, requester_uid):
+        if messages_cursor is None:
+            return
+        content = FRIEND_ACCEPTED_GREETING
+        try:
+            record = messages_cursor.add_message(
+                accepter_uid, requester_uid, content, content_type="plain",
+            )
+            if record.get("duplicate"):
+                return
+            notif = build_notification(
+                "message.plain", str(record["send_time"]), content,
+                sender="U{}".format(accepter_uid), meta={"quote": -1},
+            )
+            notif["mid"] = record["mid"]
+            notif["client_mid"] = record.get("client_mid")
+            notif["quote"] = -1
+            notif["mentioned_uids"] = []
+            notif["quote_preview"] = None
+            notif["forwarded"] = -1
+            notif["forward_preview"] = None
+
+            recv_notif = dict(notif)
+            recv_notif["room_id"] = "U{}".format(accepter_uid)
+            recv_notif["room_seq"] = record.get("room_seq")
+            recv_notif["mentions_me"] = False
+            recv_notif["should_alert"] = should_alert(
+                messages_cursor, requester_uid, recv_notif["room_id"], []
+            )
+            sender_notif = dict(notif)
+            sender_notif["room_id"] = "U{}".format(requester_uid)
+            sender_notif["room_seq"] = record.get("room_seq")
+            sender_notif["mentions_me"] = False
+            sender_notif["should_alert"] = False
+            instant_contact.push_message(requester_uid, recv_notif)
+            instant_contact.push_message(accepter_uid, sender_notif)
+        except Exception as e:
+            print("[WARN] 好友通过消息失败: {}".format(e))
 
     @api("/friend/deal_ship", methods=['POST'])
     def deal_ship(req):
@@ -7237,11 +7675,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         # rel: (user1, user2, relationship, adder, blocked_by_user1, blocked_by_user2)
         if rel[3] != dealt:
             return bool_res()[False]
-        # 只有申请接收方（非添加方）可以处理，防止申请方自行通过
+        # 只有申请接收方（非添加方）可以处理
         receiver = rel[1] if rel[3] == rel[0] else rel[0]
         if uid != receiver:
             return bool_res()[False]
-        # 仅 pending 状态可处理；已成为好友后不允许重复同意/拒绝（拒绝会误伤已有关系）
+        # 仅 pending 状态可处理
         if rel[2] != 'pending':
             return bool_res()[False]
         if stat == "allow":
@@ -7249,10 +7687,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if succeeded:
                 notify_user(dealt, "friend.accepted", "好友申请已通过",
                             "{} 已通过你的好友申请。".format(format_user_display(uid)), sender=uid)
+                send_friend_accepted_greeting(uid, dealt)
         else:
             user_cursor.delete_relationship(uid, dealt)
             succeeded = True
-        # 申请已处理，删除接收方的 friend.request 通知，避免客户端重复展示通过/拒绝按钮
+        # 申请已处理
         if succeeded:
             try:
                 notification_cursor.delete_events_by_sender(uid, "friend.request", dealt)

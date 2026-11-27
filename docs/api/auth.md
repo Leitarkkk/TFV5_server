@@ -161,12 +161,16 @@
 }
 ```
 
-其中 `<uid>` 是被操作者的用户编号，`<new_auth>` 是用户的新状态（身份），有：`root, admin, banned, user`。
+其中 `<uid>` 是被操作者的用户编号，`<new_auth>` 是用户的新角色，有：`root, admin, user`。
+
+最新版本的服务器中，不再接受 `banned` 选项。
+封禁请用 `/auth/manage/ban`，解封请用 `/auth/manage/unban`。
+被封禁中的账号（`stat = banned`）也不能改角色，需先解封。
 
 权限约束如下：
 
-- `root` 可操作所有账号，也可把账号状态修改为 `root`
-- `admin` 只能操作 `user` 与 `banned` 账号，且只能把它们改成 `user` 或 `banned`
+- `root` 可操作所有账号，也可把账号角色修改为 `root`
+- `admin` 只能操作 `user` 账号，且只能改成 `user`
 - `root` 账号只有 `root` 能修改
 - 服务端必须始终至少保留一个 `root`；最后一个 `root` 不能被降级，也不能被删除
 
@@ -200,9 +204,10 @@
 }
 ```
 
-其中 `uid/password` 是操作者的凭据，`target_password` 是新建账号的密码。`new_auth` 可省略，默认值为 `user`。
+其中 `uid/password` 是操作者的凭据，`target_password` 是新建账号的密码。`new_auth` 可省略，默认值为 `user`；只接受 `user/admin/root`，
+`banned` 会被拒绝（封禁是处罚，建号之后用 `/auth/manage/ban`）。
 
-权限约束与上文一致：`root` 可创建任意权限账号，`admin` 只能创建 `user` 或 `banned`。
+权限约束与上文一致：`root` 可创建任意角色账号，`admin` 只能创建 `user`。
 
 返回体：若创建成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
 
@@ -226,6 +231,9 @@
 
 除 `uid/password/change_uid` 外，其余字段均为可选；仅会更新请求体里显式提供的字段。
 
+`new_auth` 同样只接受 `user/admin/root`，目标账号处于封禁状态时不允许改角色
+（需先解除封禁）。
+
 权限约束与 `/auth/change_auth` 一致。若要清空邮箱，可将 `email` 设为 `null` 或空字符串。
 
 返回体：若更新成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
@@ -242,11 +250,37 @@
 }
 ```
 
-该接口等价于把目标账号状态直接改为 `banned`。`root` 可封禁任意账号，`admin` 只能封禁 `user` 或 `banned` 账号。
+该接口等价于把目标账号状态改为 `banned`，并写入 `ban_full`（完全封禁）处罚。
+
+处罚分两档，均支持永久与临时：
+
+- `ban_full` 完全封禁：无法登录，也无法用 refresh token 续期。
+- `ban` 只读封禁：可以登录、可以浏览，但**任何写入都被拒绝**。
+  只能提交 `appeal` 类型的工单且限流。
+
+
+`root` 可封禁任意账号，`admin` 只能封禁 `user` 或 `banned` 账号。
 
 账号状态封禁持续到管理员明确解除。通过 `/punishment/create` 添加的限时处罚独立到期。升级时，旧数据库中已有的 `banned` 账号会保留该状态；早期版本曾以同一状态表示待激活，管理员需核对账号历史，再决定是否解除封禁。
 
 返回体：若封禁成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
+
+- `^ POST /auth/manage/unban`
+
+请求体：
+
+```
+{
+    "uid" : <operator_uid>,
+    "password" : <operator_password>,
+    "change_uid" : <target_uid>
+}
+```
+
+解封：撤销目标账号所有生效中的 `ban_full` 处罚，并清除 `users.stat = banned`（仅作为标记，不是真实状态）。
+角色会重置为 `user`。
+
+权限与 `/auth/manage/ban` 一致。返回时间戳加 `True` / `False`。
 
 - `^ POST /auth/manage/delete`
 

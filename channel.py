@@ -79,8 +79,12 @@ def content_block(punishments_cursor, uid: int, user_stat):
     if active is None:
         return None
     kind = active[2]
-    if kind == "ban":
+    if kind == "ban_full":
+        # 完全封禁
         return "account_banned"
+    if kind == "ban":
+        # 只读封禁
+        return "account_readonly"
     if kind == "mute":
         return "account_muted"
     return None
@@ -137,6 +141,11 @@ class InstantConnect():
         self._presence_retry_limit = 3
         self._presence_lock = threading.Lock()
         self._clients_lock = threading.Lock()
+        # 每连接最近一次上行帧时间
+        self._client_last_inbound = dict()
+        self._ws_idle_limit = 300.0
+        self._reconcile_interval = 300.0
+        self._last_presence_reconcile = 0.0
         self._auth_lock = threading.Lock()
         self._auth_timestamps = defaultdict(list)
         self._auth_semaphore = asyncio.Semaphore(2)
@@ -154,8 +163,82 @@ class InstantConnect():
                     self._cleanup_read_receipts()
                 except Exception:
                     pass
+                try:
+                    self._sweep_idle_connections()
+                except Exception as e:
+                    print("[WARN] 清理 WS 连接失败: {}".format(e))
+                try:
+                    self._reconcile_presence()
+                except Exception as e:
+                    print("[WARN] 在线状态失败: {}".format(e))
         t = threading.Thread(target=_loop, daemon=True, name="tfv5-ws-rate-gc")
         t.start()
+
+    def _touch_client_activity(self, websocket):
+        """记录该连接最近一次上行帧时间（仅事件循环线程
+        """
+        if websocket in self._client_last_inbound:
+            self._client_last_inbound[websocket] = time.monotonic()
+        else:
+            with self._clients_lock:
+                self._client_last_inbound[websocket] = time.monotonic()
+
+    def _sweep_idle_connections(self):
+        """关闭长时间没有任何上行数据的已登录连接
+        """
+        if self.loop is None or self._ws_idle_limit <= 0:
+            return
+        cutoff = time.monotonic() - self._ws_idle_limit
+        with self._clients_lock:
+            stale = [
+                websocket for websocket, ts in self._client_last_inbound.items()
+                if ts < cutoff and self.clients_belonged.get(websocket, -1) != -1
+            ]
+        for websocket in stale:
+            uid = self.clients_belonged.get(websocket)
+            print("[INFO] WS 连接 {}s 无上行数据，主动断开(uid={})".format(
+                int(self._ws_idle_limit), uid))
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    websocket.close(code=1001), self.loop)
+            except Exception:
+                pass
+            # 关闭失败
+            with self._clients_lock:
+                self._client_last_inbound.pop(websocket, None)
+
+    def _reconcile_presence(self):
+        """周期性对齐"""
+        if self.loop is None or not self._presence_enabled():
+            return
+        now = time.monotonic()
+        if now - self._last_presence_reconcile < self._reconcile_interval:
+            return
+        self._last_presence_reconcile = now
+
+        with self._presence_lock:
+            flagged = [uid for uid, flag in self._presence_state.items() if flag]
+        for uid in flagged:
+            if self.filter_online([uid]):
+                continue
+            targets = self._presence_targets(uid)
+            if targets is None:
+                continue
+            if self._deliver_offline(uid, targets):
+                print("[INFO] 在线状态：uid={} 已无连接，设置 offline".format(uid))
+
+        with self._clients_lock:
+            connected = [
+                uid for uid, wss in self.connected_clients.items()
+                if uid != -1 and wss
+            ]
+        for uid in connected:
+            if self._presence_state.get(uid):
+                continue
+            try:
+                self._mark_online(uid)
+            except Exception:
+                pass
 
     def _cleanup_read_receipts(self):
         """回收已读回执节流状态：(读取者, 房间) 键随私聊对象/会话数无上限增长。
@@ -247,6 +330,14 @@ class InstantConnect():
             return (uid, payload.get("jti"), payload.get("sid"), int(auth_version), payload.get("exp"))
         return to_thread(_check)
 
+    def _is_fully_banned(self, uid: int) -> bool:
+        """完全封禁 BOOM WS"""
+        if self.punishments_cursor is not None:
+            if self.punishments_cursor.active_ban(uid) is not None:
+                return True
+        row = self.user_cursor.uid_query(uid)
+        return bool(row) and row[0][4] == "banned"
+
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         now = time.time()
         ts_dict = {
@@ -273,6 +364,11 @@ class InstantConnect():
         self.legacy_auth_enabled = bool(cfg.get("legacy_auth_enabled", True))
         raw_issuers = cfg.get("jwt_external_issuers")
         self.external_issuers = raw_issuers if isinstance(raw_issuers, list) else []
+        try:
+            idle = float(cfg.get("ws_idle_timeout", 300))
+        except (TypeError, ValueError):
+            idle = 300.0
+        self._ws_idle_limit = idle if idle > 0 else 0.0
         self.features = get_features(cfg)
         rtc_cfg = cfg.get("rtc", {})
         self.rtc_turn_enabled = bool(rtc_cfg.get("turn_enabled", False)) if isinstance(rtc_cfg, dict) else False
@@ -327,6 +423,7 @@ class InstantConnect():
             uid = self.clients_belonged.pop(websocket, -1)
             self.clients_token.pop(websocket, None)
             self.clients_session.pop(websocket, None)
+            self._client_last_inbound.pop(websocket, None)
             if uid in self.connected_clients and websocket in self.connected_clients[uid]:
                 self.connected_clients[uid].remove(websocket)
                 if uid != -1 and not self.connected_clients[uid]:
@@ -377,12 +474,40 @@ class InstantConnect():
             finally:
                 self._cleanup_client(websocket)
 
-    def notify_user(self, uid : int, notification : dict):
-        """推送系统事件通知（写入 notifications 表，再推 NOTIFICATION.NEW）
+    def _deliver_notification(self, uid : int, record : dict,
+                              event_type : str = "NOTIFICATION.NEW"):
+        if self.loop is None:
+            return
+        with self._clients_lock:
+            clients = list(self.connected_clients.get(uid, []))
+        for websocket in clients:
+            asyncio.run_coroutine_threadsafe(
+                self._queue_message(websocket, {"type" : event_type, "notification" : record}),
+                self.loop
+            )
 
-        消息事件不再走此通道，请使用 push_message / push_messages。
+    @staticmethod
+    def _ephemeral_record(notification : dict, time_stamp : float) -> dict:
+        """瞬时通知推送记录"""
+        return {
+            "id" : -1,
+            "time_stamp" : time_stamp,
+            "read_at" : None,
+            "info" : notification
+        }
+
+    def notify_user(self, uid : int, notification : dict, ephemeral : bool = False):
+        """推送系统事件通知
+
+        消息事件不再使用，请使用 push_message / push_messages
+
+        ephemeral=True 时只做实时推送
         """
         notification = dict(notification)
+        if ephemeral:
+            record = self._ephemeral_record(notification, time.time())
+            self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return record
         stored = self.notification_cursor.add_event(uid, notification)
         record = {
             "id" : stored["id"],
@@ -390,32 +515,28 @@ class InstantConnect():
             "read_at" : None,
             "info" : notification
         }
-        if self.loop is None:
-            return record
-        with self._clients_lock:
-            clients = list(self.connected_clients.get(uid, []))
-        for websocket in clients:
-            asyncio.run_coroutine_threadsafe(
-                self._queue_message(websocket, {"type" : "NOTIFICATION.NEW", "notification" : record}),
-                self.loop
-            )
+        self._deliver_notification(uid, record)
         return record
 
-    def notify_users(self, uid_notifications) -> list:
-        """批量写入系统事件通知并推送给各自已连接的客户端，单事务提交。
+    def notify_users(self, uid_notifications, ephemeral : bool = False) -> list:
+        """批量写入系统事件通知并推送给各自已连接的客户端
 
         :param uid_notifications: [(uid, notification), ...]
+        :param ephemeral: 只推送
         :return: [{id, time_stamp, read_at, info}, ...]
         """
         if not uid_notifications:
             return []
         prepared = [(int(uid), dict(notification)) for uid, notification in uid_notifications]
+        if ephemeral:
+            now = time.time()
+            records = []
+            for index, (uid, notification) in enumerate(prepared):
+                record = self._ephemeral_record(notification, now + index * 1e-6)
+                records.append(record)
+                self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return records
         stored = self.notification_cursor.add_events(prepared)
-        with self._clients_lock:
-            client_map = {
-                uid: list(self.connected_clients.get(uid, []))
-                for uid, _ in prepared
-            }
         records = []
         for (uid, notification), meta in zip(prepared, stored):
             record = {
@@ -425,19 +546,12 @@ class InstantConnect():
                 "info" : notification
             }
             records.append(record)
-            if self.loop is None:
-                continue
-            for websocket in client_map.get(uid, []):
-                asyncio.run_coroutine_threadsafe(
-                    self._queue_message(websocket, {"type" : "NOTIFICATION.NEW", "notification" : record}),
-                    self.loop
-                )
+            self._deliver_notification(uid, record)
         return records
 
     def push_message(self, uid : int, message : dict):
-        """实时推送消息事件（MESSAGE.NEW），不写入 notifications
-
-        消息只持久化在 messages 表中，离线端通过 /message/sync 增量补拉。
+        """实时推送消息事件（MESSAGE.NEW）
+        不写入 notifications
         """
         if self.loop is None:
             return message
@@ -451,9 +565,7 @@ class InstantConnect():
         return message
 
     def push_raw(self, uid : int, message : dict, exclude_websocket=None):
-        """按原样中继一条信令/消息给某用户的所有在线连接（不包 MESSAGE.NEW）
-
-        exclude_websocket: 可选的发起连接，广播（如已读回执）时不给它回声。
+        """按原样中继一条信令/消息给某用户的所有在线连接
         """
         if self.loop is None:
             return
@@ -586,13 +698,23 @@ class InstantConnect():
     def _mark_online(self, uid):
         if not self._presence_enabled():
             return
+        needs_offline = False
         with self._presence_lock:
             timer = self._presence_timers.pop(uid, None)
             if timer is not None:
                 timer.cancel()
             if self._presence_state.get(uid):
                 return
-            self._presence_state[uid] = True
+            with self._clients_lock:
+                still_connected = bool(self.connected_clients.get(uid))
+            if still_connected:
+                self._presence_state[uid] = True
+            else:
+                self._presence_state.pop(uid, None)
+                needs_offline = True
+        if needs_offline:
+            self._schedule_offline(uid)
+            return
         if not self._fanout_presence(uid, True):
             self._queue_presence_retry(uid, True)
 
@@ -645,6 +767,8 @@ class InstantConnect():
             return
         if not self.filter_online([uid]):
             return
+        with self._presence_lock:
+            self._presence_state[uid] = True
         if not self._fanout_presence(uid, True):
             self._queue_presence_retry(uid, True)
 
@@ -721,7 +845,7 @@ class InstantConnect():
             self.push_raw(peer_uid, payload)
 
     def _queue_call_ack(self, websocket, call_id, request, status):
-        """针对 call.* 信令的回执（相当于 call 专用版 _queue_ack）"""
+        """针对 call.* 信令的回执（差不多就是 call 专用版 _queue_ack）"""
         if not call_id or websocket not in self.send_queue or self.loop is None:
             return
         ack = {
@@ -733,10 +857,7 @@ class InstantConnect():
         asyncio.run_coroutine_threadsafe(self.send_queue[websocket].put(ack), self.loop)
 
     async def _handle_call_message(self, websocket, message : dict):
-        """视频通话信令中继：服务端只管两个好友之间转运，不持有任何通话状态。
-
-        call.invite / call.answer / call.ice / call.hangup 均校验好友关系与速率，
-        并以 {'type': ..., 'call_id': ..., 'from_uid': <发送者>, ...} 转发给目标。
+        """视频通话信令中继
         """
         sender_uid = self.clients_belonged[websocket]
         if not self._check_ws_rate(sender_uid):
@@ -959,6 +1080,8 @@ class InstantConnect():
                     verified_uid = login_uid if verified else None
             if verified_uid is None:
                 raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
+            if await to_thread(self._is_fully_banned, verified_uid):
+                raise ValueError("账号已被完全封禁：{}".format(verified_uid))
             queue = asyncio.Queue(maxsize=self.SEND_QUEUE_LIMIT)
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
@@ -967,6 +1090,7 @@ class InstantConnect():
                 self.clients_belonged[websocket] = verified_uid
                 self.clients_token[websocket] = verified_jti
                 self.clients_session[websocket] = verified_sid
+                self._client_last_inbound[websocket] = time.monotonic()
                 self.send_queue[websocket] = queue
                 clients.append(websocket)
             # A password change can commit between credential validation and
@@ -1001,6 +1125,7 @@ class InstantConnect():
             async for message in websocket:
                 if expires_at is not None and time.time() >= expires_at:
                     break
+                self._touch_client_activity(websocket)
                 message = json.loads(message)
                 message = json.loads(crypto.aes_decrypt(base64.b64decode(message['iv']), base64.b64decode(message['content']), self.aes_key[websocket]))
                 sender_uid = self.clients_belonged[websocket]

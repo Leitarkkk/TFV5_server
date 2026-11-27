@@ -3,14 +3,17 @@ import time
 from db.tool import Db
 
 # 处罚类型：
-#   warn  警告，不影响账号
-#   mute 禁言，无法写入内容
-#   ban 封禁
+#   warn     警告，不影响账号
+#   mute     禁言，无法写入内容
+#   ban      封禁（只读）：可以登录、可以浏览，但任何写入（含改自身资料）
+#            都被拒绝，只能提交申诉工单
+#   ban_full 完全封禁：无法登录，也无法续期
 #
-PUNISHMENT_KINDS = ("warn", "mute", "ban")
+PUNISHMENT_KINDS = ("warn", "mute", "ban", "ban_full")
 
 
-_RESTRICTION_ORDER = ("ban", "mute", "warn")
+# 高级 ban 版本
+BAN_KIND_MIGRATION = "punishment_ban_kind_v1"
 
 
 class PunishmentsDb(Db):
@@ -40,6 +43,35 @@ CREATE TABLE IF NOT EXISTS punishments (
             "CREATE INDEX IF NOT EXISTS idx_punishments_active "
             "ON punishments (uid, revoked_at, expires_at)"
         )
+        self.execute("""
+CREATE TABLE IF NOT EXISTS punishment_migrations (
+    name       TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+)
+""")
+        self._migrate_legacy_ban_kind()
+
+    def _migrate_legacy_ban_kind(self):
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT 1 FROM punishment_migrations WHERE name = ?",
+                    (BAN_KIND_MIGRATION,),
+                )
+                if self.cursor.fetchone() is not None:
+                    return False
+                self.cursor.execute(
+                    "UPDATE punishments SET kind = 'ban_full' WHERE kind = 'ban'"
+                )
+                self.cursor.execute(
+                    "INSERT INTO punishment_migrations (name, applied_at) "
+                    "VALUES (?, ?)",
+                    (BAN_KIND_MIGRATION, time.time()),
+                )
+                self.conn.commit()
+                return True
+
+            return self._execute_with_retry(operation)
 
     def create(self, uid: int, kind: str, reason: str, issued_by: int,
                duration_seconds=None) -> int:
@@ -95,7 +127,11 @@ CREATE TABLE IF NOT EXISTS punishments (
         return rows[0] if rows else None
 
     def active_ban(self, uid: int):
-        """当前生效的封禁（登录拦截"""
+        """当前生效的完全封禁"""
+        return self.active_of_kind(uid, "ban_full")
+
+    def active_readonly_ban(self, uid: int):
+        """当前生效的只读封禁"""
         return self.active_of_kind(uid, "ban")
 
     def active_mute(self, uid: int):
@@ -103,11 +139,17 @@ CREATE TABLE IF NOT EXISTS punishments (
         return self.active_of_kind(uid, "mute")
 
     def active_restriction(self, uid: int):
-        for kind in _RESTRICTION_ORDER:
-            row = self.active_of_kind(uid, kind)
-            if row is not None:
-                return row
-        return None
+        """当前生效的最高优先级处罚"""
+        rows = self.query(
+            "SELECT id, uid, kind, reason, issued_by, created_at, expires_at, "
+            "revoked_at, revoked_by FROM punishments "
+            "WHERE uid = ? AND kind IN ('ban_full', 'ban', 'mute', 'warn') "
+            "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY CASE kind WHEN 'ban_full' THEN 0 WHEN 'ban' THEN 1 "
+            "WHEN 'mute' THEN 2 ELSE 3 END, created_at DESC LIMIT 1",
+            (int(uid), time.time()),
+        )
+        return rows[0] if rows else None
 
     def revoke(self, punishment_id: int, revoked_by: int) -> bool:
         self.execute(

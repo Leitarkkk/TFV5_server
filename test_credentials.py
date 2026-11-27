@@ -28,7 +28,7 @@ class CredentialTests(unittest.TestCase):
         self.users.create_user_table()
         self.assertEqual(self.users.uid_query(self.uid)[0][USERS_COL_PUBLIC_EMAIL], 1)
 
-    def test_reading_punishments_preserves_account_ban(self):
+    def test_reading_punishments_sweeps_legacy_ban(self):
         self.assertTrue(self.users.update_user_with_root_guard(self.uid, stat="banned"))
         punishments = Mock()
         punishments.active_ban.return_value = None
@@ -40,7 +40,8 @@ class CredentialTests(unittest.TestCase):
             with app.test_request_context(), patch.object(self.users, "verify_user", return_value=True):
                 app.view_functions["punishment_list"].__wrapped__({"uid": self.uid, "password": "test"})
         punishments.list_for_user.assert_called_once_with(self.uid)
-        self.assertEqual(self.users.uid_query(self.uid)[0][4], "banned")
+        # 无生效处罚的 legacy banned 行由 _sweep_legacy_ban 还原为 user
+        self.assertEqual(self.users.uid_query(self.uid)[0][4], "user")
 
     def test_password_rotation_revokes_access_and_refresh(self):
         now = time.time()
