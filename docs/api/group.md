@@ -544,10 +544,10 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 - `group.join.approved` — 入群申请被通过（发送给申请人）
 - `group.invited` — 被邀请加入群聊（无需审核直接加入时）
 - `group.invited.pending` — 被邀请加入群聊，等待审核
-- `messages.pinned` — 群内有消息被置顶（发送给所有群成员）
-- `messages.unpinned` — 群内有消息取消置顶（发送给所有群成员）
-- `group.essence.add` — 群内有消息被设为精华（发送给被设精华的人）
-- `group.essence.remove` — 群内有消息被移除精华（发送给被移除精华的人） 
+- `messages.pinned` — 群内有消息被置顶（**瞬时通知**：`NOTIFICATION.EPHEMERAL`）
+- `messages.unpinned` — 群内有消息取消置顶（**瞬时通知**）
+- `group.essence.add` — 群内有消息被设为精华（**瞬时通知**：`NOTIFICATION.EPHEMERAL`）
+- `group.essence.remove` — 群内有消息被移除精华（**瞬时通知**）
 
 ---
 

@@ -10,7 +10,7 @@ from db.messages import FileReferenceUnavailable, MessagesDb
 
 class QueryTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(directory.cleanup)
         self.path = str(Path(directory.name) / "messages.db")
         self.db = MessagesDb(self.path, 0)

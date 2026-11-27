@@ -4,7 +4,9 @@
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from json_store import read_json, update_json
 import secrets
+import ssl
 import smtplib
 from string import ascii_letters, digits
 from email.mime.text import MIMEText
@@ -16,9 +18,8 @@ from time import time
 from json_store import read_json, update_json
 
 MAX_DELAY = 300
-EMAIL_CODE_LIFETIME = 15 * 60
-ACTIVATION = "activation"
-PASSWORD_RESET = "password_reset"
+EMAIL_CODE_TTL = 600
+EMAIL_CODE_ATTEMPTS = 5
 
 def login_email(sender_email : str, password : str, smtp_host=None, smtp_port=None, smtp_use_ssl=True):
     """
@@ -33,16 +34,14 @@ def login_email(sender_email : str, password : str, smtp_host=None, smtp_port=No
         smtp_server = 'smtp.' + sender_email.split('@')[1]
     if smtp_port is None:
         smtp_port = 465 if smtp_use_ssl else 587
-    smtp_class = smtplib.SMTP_SSL if smtp_use_ssl else smtplib.SMTP
-    server = smtp_class(smtp_server, smtp_port, timeout=10)
-    try:
-        if not smtp_use_ssl:
-            server.starttls()
-        server.login(sender_email, password)
-        return server
-    except Exception:
-        server.close()
-        raise
+    context = ssl.create_default_context()
+    if smtp_use_ssl:
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10, context=context)
+    else:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+        server.starttls(context=context)
+    server.login(sender_email, password)
+    return server
 
 def send_email(server, sender_email : str, receiver_email : str, subject : str, content : str):
     """
@@ -59,107 +58,79 @@ def send_email(server, sender_email : str, receiver_email : str, subject : str, 
         return False
     return True
 
-def _captcha_record(stamp, value):
-    if isinstance(value, dict):
-        return value["answer"], value["expires_at"]
-    # Older images use the Unix timestamp as their stamp and store only the answer.
-    return value, int(stamp) + MAX_DELAY
+def _captcha_expiry(stamp, entry):
+    if isinstance(entry, dict):
+        return entry["expires_at"]
+    return int(stamp) + MAX_DELAY
 
-
-def _remove_legacy_image(folder_path, stamp):
-    try:
-        os.remove(os.path.join(folder_path, "{}.png".format(int(stamp))))
-    except (OSError, ValueError):
-        pass
 
 def generate_captcha(port_api : int, Imgcaptcha, lock):
-    """Return an independent integer stamp and the generated PNG."""
-    folder_path = "res/{}/captcha".format(port_api)
-    captcha_text = ''.join(secrets.choice(ascii_letters + digits) for _ in range(6))
-    with Imgcaptcha.generate(captcha_text) as image:
-        png = image.read()
-
-    def issue(challenges):
-        now = time()
-        for stamp, value in list(challenges.items()):
-            _, expires_at = _captcha_record(stamp, value)
-            if now >= expires_at:
-                del challenges[stamp]
-                if isinstance(value, str):
-                    _remove_legacy_image(folder_path, stamp)
-        # Keep the opaque ID within JavaScript's safe integer range.
-        while True:
-            stamp = (1 << 52) + secrets.randbelow(1 << 52)
-            if str(stamp) not in challenges:
-                break
-        challenges[str(stamp)] = {"answer": captcha_text, "expires_at": now + MAX_DELAY}
-        return stamp
-
+    folder = "res/{}/captcha".format(port_api)
+    now = time()
+    answer = ''.join(secrets.choice(ascii_letters + digits) for _ in range(6))
     with lock:
-        stamp = update_json(os.path.join(folder_path, "captcha.json"), issue)
-    return stamp, png
+        def issue(records):
+            for stamp, entry in list(records.items()):
+                if _captcha_expiry(stamp, entry) <= now:
+                    del records[stamp]
+                    try:
+                        os.remove(os.path.join(folder, "{}.png".format(int(stamp))))
+                    except FileNotFoundError:
+                        pass
+            stamp = secrets.randbits(52)
+            while str(stamp) in records:
+                stamp = secrets.randbits(52)
+            Imgcaptcha.write(answer, os.path.join(folder, "{}.png".format(stamp)))
+            records[str(stamp)] = {"answer": answer, "expires_at": now + MAX_DELAY}
+            return stamp
 
-def verify_captcha(port_api : int, time_stamp : int | str, verify_text : str, lock):
-    """
-    校验验证码（校验一次之后就报废啦）
-    """
-    if (
-        isinstance(time_stamp, str) and len(time_stamp) <= 16
-        and time_stamp.isascii() and time_stamp.isdecimal()
-    ):
-        time_stamp = int(time_stamp)
-    if type(time_stamp) is not int or not 0 <= time_stamp < (1 << 53) or not isinstance(verify_text, str):
+        return update_json(os.path.join(folder, 'captcha.json'), issue, default=dict)
+
+
+def verify_captcha(port_api : int, time_stamp : int, verify_text : str, lock):
+    try:
+        stamp = str(int(time_stamp))
+    except (TypeError, ValueError):
         return False, False
-    stamp = str(time_stamp)
-    folder_path = "res/{}/captcha".format(port_api)
-    path = os.path.join(folder_path, "captcha.json")
-
-    def verify(challenges):
-        value = challenges.pop(stamp, None)
-        if value is None:
-            return False, False
-        answer, expires_at = _captcha_record(stamp, value)
-        if isinstance(value, str):
-            _remove_legacy_image(folder_path, stamp)
-        if time() >= expires_at:
-            return False, False
-        return answer.lower() == verify_text.lower(), True
-
+    folder = "res/{}/captcha".format(port_api)
     with lock:
-        if stamp not in read_json(path):
-            return False, False
-        return update_json(path, verify)
+        def consume(records):
+            entry = records.pop(stamp, None)
+            if entry is None:
+                return False, False
+            try:
+                os.remove(os.path.join(folder, stamp + ".png"))
+            except FileNotFoundError:
+                return False, False
+            if _captcha_expiry(stamp, entry) <= time():
+                return False, False
+            answer = entry["answer"] if isinstance(entry, dict) else entry
+            return answer.lower() == str(verify_text).lower(), True
 
-def issue_email_code(port_api : int, email : str, activate_lock, *, uid: int, purpose: str):
-    """生成验证码并同步写入 activate.json，返回验证码 必须在请求返回前完成"""
-    def issue(codes):
-        now = time()
-        for address, entries in list(codes.items()):
-            # Integer entries were written by older versions.
-            if isinstance(entries, dict):
-                fresh = {key: entry for key, entry in entries.items() if now < entry["expires_at"]}
-                if fresh:
-                    codes[address] = fresh
-                else:
-                    del codes[address]
-        entries = codes.get(email)
-        if not isinstance(entries, dict):
-            entries = {}
-            codes[email] = entries
-        current = entries.get(purpose)
-        if current and current["uid"] == uid:
-            # Resends can arrive out of order, so keep the current valid code.
-            return current["code"]
-        used_codes = {entry["code"] for entry in entries.values()}
-        while True:
-            verify_code = 100000 + secrets.randbelow(900000)
-            if verify_code not in used_codes:
-                break
-        entries[purpose] = {"code": verify_code, "uid": uid, "expires_at": now + EMAIL_CODE_LIFETIME}
-        return verify_code
+        return update_json(os.path.join(folder, 'captcha.json'), consume, default=dict)
 
+
+def issue_email_code(port_api, email, activate_lock, *, uid, purpose):
+    now = time()
+    key = f"{purpose}:{uid}"
     with activate_lock:
-        return update_json("res/{}/activate.json".format(port_api), issue)
+        def issue(records):
+            for k, entry in list(records.items()):
+                if not isinstance(entry, dict) or entry.get("expires_at", 0) <= now:
+                    del records[k]
+            previous = records.get(key)
+            if isinstance(previous, dict) and previous.get("email") == email:
+                code = previous["code"]
+                attempts_left = previous.get("attempts_left", EMAIL_CODE_ATTEMPTS)
+            else:
+                code = secrets.randbelow(900000) + 100000
+                attempts_left = EMAIL_CODE_ATTEMPTS
+            records[key] = {
+                "email": email, "code": code, "expires_at": now + EMAIL_CODE_TTL,
+                "attempts_left": attempts_left,
+            }
+            return code
+        return update_json("res/{}/activate.json".format(port_api), issue, default=dict)
 
 
 def send_email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, verify_code : int):
@@ -172,13 +143,12 @@ def send_email_code(sender_email : str, port_api : int, email : str, password : 
         smtp_port = cfg.get("smtp_port")
         smtp_use_ssl = cfg.get("smtp_use_ssl", True)
     session = login_email(sender_email, password, smtp_host, smtp_port, smtp_use_ssl)
-    try:
-        return send_email(session, sender_email, email, "{} 验证码".format(server_name), "欢迎使用 {}，您的验证码是 {}。".format(server_name, verify_code))
-    finally:
-        try:
-            session.quit()
-        except (smtplib.SMTPException, OSError):
-            session.close()
+    return send_email(session, sender_email, email, "{} 验证码".format(server_name), "欢迎使用 {}，您的验证码是 {}。".format(server_name, verify_code))
+
+
+def email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, activate_lock, *, uid, purpose):
+    verify_code = issue_email_code(port_api, email, activate_lock, uid=uid, purpose=purpose)
+    return send_email_code(sender_email, port_api, email, password, config_lock, verify_code)
 
 
 # 避免被刷爆 IO
@@ -222,23 +192,33 @@ def email_code_async(sender_email, port_api, email, password, config_lock, activ
         return False
     return True
 
-def verify_email(port_api : int, email : str, code : int, lock, *, uid: int, purpose: str, allow_legacy: bool):
-    if type(code) is not int or not 100000 <= code <= 999999:
+def verify_email(port_api, email, code, lock, *, uid, purpose):
+    if not isinstance(code, int):
         return False
-    folder_path = "res/{}/".format(port_api)
+    key = f"{purpose}:{uid}"
     with lock:
-        def verify(code_lst):
-            entries = code_lst.get(email)
-            if allow_legacy and type(entries) is int and entries == code:
-                del code_lst[email]
+        def check(records):
+            entry = records.get(key)
+            if not isinstance(entry, dict) or entry["email"] != email:
+                return False
+            if entry["expires_at"] <= time():
+                del records[key]
+                return False
+            if entry["code"] == code:
                 return True
-            if not isinstance(entries, dict):
-                return False
-            entry = entries.get(purpose)
-            if not entry or entry["uid"] != uid or entry["code"] != code or time() >= entry["expires_at"]:
-                return False
-            del entries[purpose]
-            if not entries:
-                del code_lst[email]
-            return True
-        return update_json(folder_path + '/activate.json', verify)
+            entry["attempts_left"] -= 1
+            if entry["attempts_left"] <= 0:
+                del records[key]
+            return False
+        return update_json("res/{}/activate.json".format(port_api), check, default=dict)
+
+
+def consume_email_code(port_api, email, code, lock, *, uid, purpose):
+    """状态变更成功后作废验证码"""
+    key = f"{purpose}:{uid}"
+    with lock:
+        def consume(records):
+            entry = records.get(key)
+            if isinstance(entry, dict) and entry.get("email") == email and entry.get("code") == code:
+                del records[key]
+        update_json("res/{}/activate.json".format(port_api), consume, default=dict)

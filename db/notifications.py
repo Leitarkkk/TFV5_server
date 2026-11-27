@@ -4,6 +4,20 @@ import time
 
 _MESSAGE_EVENTS = {"message.plain", "message.file", "message.recalled"}
 
+# 瞬时事件
+_TRANSIENT_EVENTS = {
+    "group.essence.add",
+    "group.essence.remove",
+    "messages.pinned",
+    "messages.unpinned",
+}
+# 清理时先用缩小候选
+_TRANSIENT_LIKE_PATTERNS = (
+    "%group.essence.%",
+    "%messages.pinned%",
+    "%messages.unpinned%",
+)
+
 class NotificationsDb(Db):
     def __init__(self, path: str, port_api: int, dialect=None):
         super().__init__(path, port_api, -1, dialect=dialect)
@@ -12,6 +26,7 @@ class NotificationsDb(Db):
         self._ensure_unified_table()
         self._migrate_new_columns()
         self._migrate_legacy_tables()
+        self._purge_transient_events()
 
     def _ensure_unified_table(self):
         """统一通知表"""
@@ -131,6 +146,41 @@ CREATE TABLE IF NOT EXISTS notification_meta (
 
         if migrated:
             print("[INFO] DATABASE 自动迁移了 {} 个旧版每用户表到统一表".format(migrated))
+
+    def _purge_transient_events(self):
+        with self.lock:
+            def operation():
+                marker = self.cursor.execute(
+                    "SELECT value FROM notification_meta WHERE key = 'transient_purged'"
+                ).fetchone()
+                if marker:
+                    self.conn.commit()
+                    return 0
+                rows = []
+                for pattern in _TRANSIENT_LIKE_PATTERNS:
+                    rows.extend(self.cursor.execute(
+                        "SELECT id, info FROM notifications WHERE info LIKE ?",
+                        (pattern,),
+                    ).fetchall())
+                target_ids = sorted({
+                    nid for nid, raw_info in rows
+                    if self._deserialize_event(raw_info).get("event") in _TRANSIENT_EVENTS
+                })
+                if target_ids:
+                    placeholders = ",".join("?" * len(target_ids))
+                    self.cursor.execute(
+                        "DELETE FROM notifications WHERE id IN ({})".format(placeholders),
+                        tuple(target_ids),
+                    )
+                self.cursor.execute(
+                    "INSERT OR REPLACE INTO notification_meta(key, value) "
+                    "VALUES ('transient_purged', '1')"
+                )
+                self.conn.commit()
+                return len(target_ids)
+            removed = self._execute_with_retry(operation)
+        if removed:
+            print("[INFO] DATABASE 清理了 {} 条瞬时通知（精华/置顶）".format(removed))
 
     def _serialize_event(self, event):
         if isinstance(event, (dict, list)):

@@ -16,7 +16,7 @@ from db.notifications import NotificationsDb
 
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 

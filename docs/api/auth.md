@@ -144,11 +144,11 @@
 }
 ```
 
-其中 `<new_pwd>` 是新密码。
+其中 `<new_pwd>` 是新密码。注册、重置密码、自助改密和管理端设置密码均使用服务器的 `min_password_length`，未配置时为 8。
 
 返回：若密码更改成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
 
-**注意：修改密码会使该用户已签发的全部 JWT 立即失效。**
+修改或重置密码成功后，服务端会撤销该用户的访问令牌和刷新会话，并断开已有 WebSocket 连接。使用带有效期的访问令牌建立的 WebSocket 在令牌过期时关闭；客户端应刷新令牌并重新连接。
 
 - `^ POST /auth/change_auth`
 
@@ -161,12 +161,16 @@
 }
 ```
 
-其中 `<uid>` 是被操作者的用户编号，`<new_auth>` 是用户的新状态（身份），有：`root, admin, banned, user`。
+其中 `<uid>` 是被操作者的用户编号，`<new_auth>` 是用户的新角色，有：`root, admin, user`。
+
+最新版本的服务器中，不再接受 `banned` 选项。
+封禁请用 `/auth/manage/ban`，解封请用 `/auth/manage/unban`。
+被封禁中的账号（`stat = banned`）也不能改角色，需先解封。
 
 权限约束如下：
 
-- `root` 可操作所有账号，也可把账号状态修改为 `root`
-- `admin` 只能操作 `user` 与 `banned` 账号，且只能把它们改成 `user` 或 `banned`
+- `root` 可操作所有账号，也可把账号角色修改为 `root`
+- `admin` 只能操作 `user` 账号，且只能改成 `user`
 - `root` 账号只有 `root` 能修改
 - 服务端必须始终至少保留一个 `root`；最后一个 `root` 不能被降级，也不能被删除
 
@@ -200,9 +204,10 @@
 }
 ```
 
-其中 `uid/password` 是操作者的凭据，`target_password` 是新建账号的密码。`new_auth` 可省略，默认值为 `user`。
+其中 `uid/password` 是操作者的凭据，`target_password` 是新建账号的密码。`new_auth` 可省略，默认值为 `user`；只接受 `user/admin/root`，
+`banned` 会被拒绝（封禁是处罚，建号之后用 `/auth/manage/ban`）。
 
-权限约束与上文一致：`root` 可创建任意权限账号，`admin` 只能创建 `user` 或 `banned`。
+权限约束与上文一致：`root` 可创建任意角色账号，`admin` 只能创建 `user`。
 
 返回体：若创建成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
 
@@ -226,6 +231,9 @@
 
 除 `uid/password/change_uid` 外，其余字段均为可选；仅会更新请求体里显式提供的字段。
 
+`new_auth` 同样只接受 `user/admin/root`，目标账号处于封禁状态时不允许改角色
+（需先解除封禁）。
+
 权限约束与 `/auth/change_auth` 一致。若要清空邮箱，可将 `email` 设为 `null` 或空字符串。
 
 返回体：若更新成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
@@ -242,9 +250,37 @@
 }
 ```
 
-该接口等价于把目标账号状态直接改为 `banned`。`root` 可封禁任意账号，`admin` 只能封禁 `user` 或 `banned` 账号。
+该接口等价于把目标账号状态改为 `banned`，并写入 `ban_full`（完全封禁）处罚。
+
+处罚分两档，均支持永久与临时：
+
+- `ban_full` 完全封禁：无法登录，也无法用 refresh token 续期。
+- `ban` 只读封禁：可以登录、可以浏览，但**任何写入都被拒绝**。
+  只能提交 `appeal` 类型的工单且限流。
+
+
+`root` 可封禁任意账号，`admin` 只能封禁 `user` 或 `banned` 账号。
+
+账号状态封禁持续到管理员明确解除。通过 `/punishment/create` 添加的限时处罚独立到期。升级时，旧数据库中已有的 `banned` 账号会保留该状态；早期版本曾以同一状态表示待激活，管理员需核对账号历史，再决定是否解除封禁。
 
 返回体：若封禁成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
+
+- `^ POST /auth/manage/unban`
+
+请求体：
+
+```
+{
+    "uid" : <operator_uid>,
+    "password" : <operator_password>,
+    "change_uid" : <target_uid>
+}
+```
+
+解封：撤销目标账号所有生效中的 `ban_full` 处罚，并清除 `users.stat = banned`（仅作为标记，不是真实状态）。
+角色会重置为 `user`。
+
+权限与 `/auth/manage/ban` 一致。返回时间戳加 `True` / `False`。
 
 - `^ POST /auth/manage/delete`
 
@@ -507,7 +543,7 @@
 }
 ```
 
-`<pic>` 是 `png` 格式图片的 Base64 编码用 `utf-8` 解码后的格式，`<stamp>` 是验证码标识码（时间戳，为整数）。
+`<pic>` 是 `png` 格式图片的 Base64 编码用 `utf-8` 解码后的格式，`<stamp>` 是验证码标识码（整数）。
 
 若服务器启用了第三方验证码（`captcha_provider` 非 `image`），本接口同样返回空对象，客户端应改用 `/auth/captcha/page`。
 
@@ -580,7 +616,7 @@
 }
 ```
 
-`<public_email>` 必须为布尔值。默认公开；关闭后公共查询接口返回空邮箱，管理端查询不受影响。
+`<public_email>` 必须为布尔值。新注册用户默认隐藏邮箱，已有可见性设置会保留。关闭后公共查询接口返回空邮箱，管理端仍可查询。
 
 - `^ POST /auth/change_privacy` 设置隐私开关（鉴权）。
 
@@ -640,7 +676,7 @@
 返回体：如果激活成功返回时间戳加 `True`，否则返回时间戳加 `False`。
 
 验证码在 `/auth/register` 返回时就已写入服务端（只是邮件发送是异步的），
-所以注册成功后可以立刻调用本接口。新验证码有效期为 15 分钟，激活与重置密码分别使用各自的验证码。
+所以注册成功后可以立刻调用本接口。邮箱验证码按账号及用途绑定，有效期十分钟，连续五次错误后失效。升级前签发的邮箱验证码需要重新申请。
 
 - `POST /auth/resend_activation` 重发激活验证码
 
@@ -652,8 +688,8 @@
 }
 ```
 
-用于注册邮件未送达或验证码过期的情况。待激活账号（`pending`）会收到验证码，
-有效期内重发会使用当前验证码。已激活账号直接返回成功，封禁账号返回失败。
+用于注册邮件没送达（SMTP 失败、邮箱写错后重新注册等）的情况。只有仍处于
+`pending`（待激活）的账号会收到新码。已激活账号直接返回成功，管理员封禁的账号返回失败。
 
 返回体：验证码已生成并开始发送时返回时间戳加 `True`；凭据错误、账号不存在、
 服务器未启用邮箱验证或发信队列已满时返回时间戳加 `False`。
@@ -677,7 +713,7 @@
 
 验证码字段的选用取决于服务器的 `captcha_provider`（可从 `/info` 获取）：
 
-- `image`（默认）：传入 `captcha_stamp` 和 `captcha_code`。`captcha_stamp` 请填写 `/auth/captcha` 返回体中的整数标识 `stamp`。图片验证码**一次性有效**：无论校验是否通过，该 `stamp` 都会立即作废，客户端必须重新调用 `/auth/captcha` 获取新验证码后才能重试。
+- `image`（默认）：传入 `captcha_stamp` 和 `captcha_code`。`captcha_stamp` 请填写 `/auth/captcha` 返回体中的 `stamp`；该值返回为整数，服务端校验时会将其转为整数处理。图片验证码**一次性有效**：无论校验是否通过，该 `stamp` 都会立即作废，客户端必须重新调用 `/auth/captcha` 获取新验证码后才能重试。
 - 第三方（`turnstile` / `hcaptcha` / `recaptcha`）：传入 `captcha_token`，即 `/auth/captcha/page` 渲染页回调返回的 token。
 
 验证码校验失败（错误、过期或已使用）返回 `{"error": "captcha_invalid"}`（详细模式下为 `CAPTCHA_INVALID`，HTTP 400），客户端应重新获取验证码后重试。
@@ -686,7 +722,7 @@
 
 如果服务器不启用邮箱激活，`<email>` 是可以省略的。
 
-注册成功返回时间戳加 True，否则返回时间戳加 False。启用邮箱验证时，用户初始状态为 `pending`。
+注册成功返回时间戳加 True，否则返回时间戳加 False。需要邮箱验证时，用户初始状态为 `pending`。
 
 **注册开关**：实例配置 `allow_register`（默认 `true`，可从 `/info` 读取）为 `false` 时，
 该端点返回 `{"error": "register_disabled"}`（详细模式下为 `REGISTER_DISABLED`，HTTP 403），

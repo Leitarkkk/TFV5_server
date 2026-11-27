@@ -47,7 +47,7 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
         users.uid_query.return_value = [(8, "sender", None, None, "user")]
         users.get_show_status_flags.return_value = {}
         users.is_friend.side_effect = lambda sender, recipient: (sender, recipient) == (8, 9)
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             with MessagesDb(str(Path(temp) / "messages.db"), 0) as messages:
                 contact = make_channel(users, messages, private_key)
                 contact.file_cursor = Mock()
@@ -115,7 +115,7 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
         users.get_show_status_flags.return_value = {}
         users.uid_query.return_value = [(8, "sender", None, None, "user")]
         users.query.return_value = [(9, "reader")]
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             with GroupDb(str(Path(temp) / "groups.db"), 0, config_reader=dict) as groups, \
                     MessagesDb(str(Path(temp) / "messages.db"), 0) as messages:
                 gid = groups.create_group(8, "Room", "", "")
@@ -299,7 +299,7 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
             if len(calls) == 1:
                 checking.set()
                 await resume.wait()
-                return 8, "token", "session"
+                return 8, "token", "session", None, None
             return None
 
         contact._verify_ws_token = verify

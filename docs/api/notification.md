@@ -314,6 +314,40 @@ token 无效/过期/吊销（改密、封禁）时登录失败，连接会被关
 
 客户端收到 `NOTIFICATION.NEW` 后，可以直接展示，也可以用其中的 `time_stamp` 配合 `query_after` 或 `delete_before` 做本地同步与清理。
 
+#### 瞬时通知（NOTIFICATION.EPHEMERAL）
+
+部分事件只是即时提示，没有需要用户逐条处理或标记已读的语义，服务端不写入、不产生未读数，
+只推给当前在线的客户端：
+
+```json
+{
+    "type" : "NOTIFICATION.EPHEMERAL",
+    "notification" : {
+        "id" : -1,
+        "time_stamp" : <time_stamp>,
+        "read_at" : null,
+        "info" : {
+            "event" : "group.essence.add",
+            "title" : "<title>",
+            "content" : "<content>",
+            "sender" : <sender_uid>,
+            "meta" : {"gid" : <gid>}
+        }
+    }
+}
+```
+
+`id` 固定为 `-1`，表示该通知无法（也不需要）按 id 标记已读。客户端应当只做即时提醒
+（应用内横幅 / 系统通知）并按需刷新对应页面，**不要**放进通知中心列表或计入未读角标。
+
+当前属于瞬时事件的类型：
+
+- `group.essence.add` — 消息被设为精华
+- `group.essence.remove` — 消息被移除精华
+- `messages.pinned` — 群内有消息被置顶
+- `messages.unpinned` — 群内有消息取消置顶
+
+
 ### 聊天消息的实时推送（v2）
 
 自 v2 起，聊天消息不再通过 `NOTIFICATION.NEW` 推送，改为独立的 `MESSAGE.NEW` 事件：

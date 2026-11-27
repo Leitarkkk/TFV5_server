@@ -92,8 +92,12 @@ def content_block(punishments_cursor, uid: int, user_stat):
     if active is None:
         return None
     kind = active[2]
-    if kind == "ban":
+    if kind == "ban_full":
+        # 完全封禁
         return "account_banned"
+    if kind == "ban":
+        # 只读封禁
+        return "account_readonly"
     if kind == "mute":
         return "account_muted"
     return None
@@ -380,12 +384,12 @@ class InstantConnect():
         rows = self.user_cursor.uid_query(uid)
         if not rows or not self._allows_login(uid, rows[0][4]):
             return None
-        return uid, None, None
+        return uid, None, None, None, None
 
     def _verify_ws_token(self, token: str):
         """
         校验词元（bushi）
-        返回 (uid, jti, sid) 或 None。
+        返回 (uid, jti, sid, auth_version, exp) 或 None。
         """
         def _check():
             # 本服签发 token：HS* 用 jwt_secret，非对称用密钥环（按 kid 选钥）
@@ -406,7 +410,7 @@ class InstantConnect():
                     return None
                 if int(row[1]) != int(payload.get("av", -1)):
                     return None
-                return (uid, jti, sid)
+                return (uid, jti, sid, int(row[1]), payload.get("exp"))
 
             # 外部签发 token：与 HTTP 旧版直接接受路径保持一致（sub 必须是本地 uid 且 av 匹配）。
             # 推荐仍先走 /auth/external/login 换成本地会话 token 再连 WS。
@@ -425,8 +429,16 @@ class InstantConnect():
             auth_version = self.user_cursor.get_auth_version(uid)
             if int(payload.get("av", -1)) != int(auth_version):
                 return None
-            return (uid, payload.get("jti"), payload.get("sid"))
+            return (uid, payload.get("jti"), payload.get("sid"), int(auth_version), payload.get("exp"))
         return self._auth_work(_check)
+
+    def _is_fully_banned(self, uid: int) -> bool:
+        """完全封禁 BOOM WS"""
+        if self.punishments_cursor is not None:
+            if self.punishments_cursor.active_ban(uid) is not None:
+                return True
+        row = self.user_cursor.uid_query(uid)
+        return bool(row) and row[0][4] == "banned"
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         buckets = (self._ws_typing_timestamps if bucket == "typing"
@@ -580,12 +592,32 @@ class InstantConnect():
             ack["error"] = error
         self._queue_message(websocket, ack)
 
-    def notify_user(self, uid : int, notification : dict):
+    def _deliver_notification(self, uid : int, record : dict,
+                              event_type : str = "NOTIFICATION.NEW"):
+        self.push_raw(uid, {"type" : event_type, "notification" : record})
+
+    @staticmethod
+    def _ephemeral_record(notification : dict, time_stamp : float) -> dict:
+        """瞬时通知推送记录"""
+        return {
+            "id" : -1,
+            "time_stamp" : time_stamp,
+            "read_at" : None,
+            "info" : notification
+        }
+
+    def notify_user(self, uid : int, notification : dict, ephemeral : bool = False):
         """推送系统事件通知
 
         消息事件不再使用，请使用 push_message / push_messages
+
+        ephemeral=True 时只做实时推送
         """
         notification = dict(notification)
+        if ephemeral:
+            record = self._ephemeral_record(notification, time.time())
+            self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return record
         stored = self.notification_cursor.add_event(uid, notification)
         record = {
             "id" : stored["id"],
@@ -596,15 +628,24 @@ class InstantConnect():
         self.push_raw(uid, {"type": "NOTIFICATION.NEW", "notification": record})
         return record
 
-    def notify_users(self, uid_notifications) -> list:
+    def notify_users(self, uid_notifications, ephemeral : bool = False) -> list:
         """批量写入系统事件通知并推送给各自已连接的客户端
 
         :param uid_notifications: [(uid, notification), ...]
+        :param ephemeral: 只推送
         :return: [{id, time_stamp, read_at, info}, ...]
         """
         if not uid_notifications:
             return []
         prepared = [(int(uid), dict(notification)) for uid, notification in uid_notifications]
+        if ephemeral:
+            now = time.time()
+            records = []
+            for index, (uid, notification) in enumerate(prepared):
+                record = self._ephemeral_record(notification, now + index * 1e-6)
+                records.append(record)
+                self._deliver_notification(uid, record, "NOTIFICATION.EPHEMERAL")
+            return records
         stored = self.notification_cursor.add_events(prepared)
         targets = self._outboxes_by_uid(uid for uid, _ in prepared)
         records = []
@@ -1053,7 +1094,11 @@ class InstantConnect():
                 identity = None
             if identity is None:
                 raise ValueError("WS authentication failed")
-            uid, jti, sid = identity
+            uid, jti, sid, _auth_version, expires_at = identity
+            if expires_at is not None:
+                expires_at = int(expires_at)
+                if expires_at <= time.time():
+                    raise ValueError("Token expired")
             with self._clients_lock:
                 if revision != self._auth_revision:
                     continue
@@ -1066,7 +1111,7 @@ class InstantConnect():
                 self.clients_session[websocket] = sid
                 self._client_last_inbound[websocket] = time.monotonic()
                 self.send_queue[websocket] = queue
-                return uid, became_online, queue
+                return uid, became_online, queue, expires_at
 
     async def sender(self, websocket, queue):
         try:
@@ -1110,34 +1155,44 @@ class InstantConnect():
             print("[ERR] 客户端链接 WS 服务器后没有发出 AES 密钥声明")
             return
         
+        expiry_task = None
+        send_task = None
+        expires_at = None
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
             message = json.loads(message)
             message = json.loads(crypto.aes_decrypt(base64.b64decode(message['iv']), base64.b64decode(message['content']), self.aes_key[websocket]))
             if message['type'] != 'AUTH.LOGIN':
                 raise ValueError("{} 而非 AUTH.LOGIN".format(message.get('type')))
-            verified_uid, became_online, queue = await asyncio.wait_for(
+            verified_uid, became_online, queue, expires_at = await asyncio.wait_for(
                 self._register_login(websocket, message), timeout=10.0)
             if queue.closed:
                 self._cleanup_client(websocket)
                 return
+            if expires_at is not None:
+                expiry_task = asyncio.create_task(self._close_on_expiry(websocket, expires_at))
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
-            if became_online:
+            if became_online and self.send_queue.get(websocket) is queue:
                 await to_thread(self._mark_online, verified_uid)
+            if self.send_queue.get(websocket) is not queue:
+                return
+            send_task = asyncio.create_task(self.sender(websocket, queue))
 
         except asyncio.CancelledError:
             self._cleanup_client(websocket)
             raise
         except Exception:
             print("[ERR] 客户端链接 WS 服务器后没有登录")
-            self._cleanup_client(websocket)
             return
-        
-        send_task = asyncio.create_task(self.sender(websocket, queue))
+        finally:
+            if send_task is None:
+                if expiry_task is not None:
+                    expiry_task.cancel()
+                self._cleanup_client(websocket)
 
         try:
             async for message in websocket:
-                if queue.closed:
+                if queue.closed or (expires_at is not None and time.time() >= expires_at):
                     break
                 self._touch_client_activity(websocket)
                 message = json.loads(message)
@@ -1599,10 +1654,17 @@ class InstantConnect():
             print("[ERR] WS消息处理异常: {}".format(e))
 
         finally:
+            if expiry_task is not None:
+                expiry_task.cancel()
             send_task.cancel()
             await asyncio.gather(send_task, return_exceptions=True)
             self._cleanup_client(websocket)
             
+
+    @staticmethod
+    async def _close_on_expiry(websocket, expires_at):
+        await asyncio.sleep(max(0, expires_at - time.time()))
+        await websocket.close(code=1008, reason="Token expired")
 
     async def main(self):
         print("[INFO] 已严肃启动 TCP 服务器")

@@ -739,17 +739,18 @@ class MessagesDb(Db):
 
     def verify_quote(self, quote_mid: int, sender_uid: int = 0,
                      target_uid: int = 0, group_id: int = None) -> bool:
+        """
+        引用的目标消息是否可被当前会话引用
+        """
         rows = self.query(
-            "SELECT sender_uid, receiver_uid, group_id, deleted, content_type "
+            "SELECT sender_uid, receiver_uid, group_id, content_type "
             "FROM messages WHERE mid = ?",
             (quote_mid,)
         )
         if not rows:
             return False
         r = rows[0]
-        if r[3]:  # deleted
-            return False
-        if r[4] == 'event':  # 事件行不是用户内容
+        if r[3] == 'event':  # 事件行不是用户内容
             return False
         if group_id is not None:
             return r[2] == group_id

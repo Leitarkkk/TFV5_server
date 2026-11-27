@@ -43,6 +43,9 @@
 | `EXTERNAL_NOT_LINKED` | External identity is not linked to a local account | 403 |
 | `EXTERNAL_ALREADY_LINKED` | External identity is already linked | 409 |
 | `PERMISSION_DENIED` | You do not have permission to perform this action | 403 |
+| `account_banned` | User account is banned (full ban: cannot sign in) | 403 |
+| `account_readonly` | Account is read-only due to a ban | 403 |
+| `account_muted` | User account is muted | 403 |
 | `PERMISSION_NOT_FRIENDS` | Users are not friends | 403 |
 | `FRIEND_BLOCKED` | This user is not accepting friend requests | 403 |
 | `PERMISSION_NOT_GROUP_MEMBER` | User is not a member of this group | 403 |
