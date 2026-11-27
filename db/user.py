@@ -57,6 +57,8 @@ class UserDb(Db):
         """
         if stat != "pending" and stat not in ALLOWED_USER_STATS:
             return False
+        if stat == "pending" and not email:
+            return False
         if not isinstance(username, str) or len(username) > 20 or len(username) < 4 or " " in username:
             return False
         if email and not re.fullmatch(email_regex, email):
@@ -346,7 +348,7 @@ class UserDb(Db):
         if "public_email" not in columns:
             try:
                 self.execute(
-                    "ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 0"
+                    "ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 1"
                 )
             except Exception:
                 pass

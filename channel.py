@@ -1093,9 +1093,6 @@ class InstantConnect():
                 self._client_last_inbound[websocket] = time.monotonic()
                 self.send_queue[websocket] = queue
                 clients.append(websocket)
-            # A password change can commit between credential validation and
-            # registering this socket for disconnect_user(). Check again before
-            # acknowledging the connection or draining any buffered pushes.
             if await to_thread(self.user_cursor.get_auth_version, verified_uid) != auth_version:
                 raise ValueError("Credentials changed during login")
             if self.send_queue.get(websocket) is not queue:

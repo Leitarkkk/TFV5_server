@@ -5,6 +5,7 @@ import base64
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from db import FileDb
 import hashlib
 from file_types import detect_file_type
@@ -392,7 +393,7 @@ def force_delete_file(port_api : int, hashes : str, file_cursor : FileDb):
 def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index : int,
                         chunk_total : int, chunk_data_b64 : str, file_id : str = None,
                         file_cursor : FileDb = None, expected_hash : str = None, *,
-                        max_file_size : int = -1, storage_quota : int = -1):
+                        max_file_size : int = -1, storage_quota : int = -1, quota_guard = None):
     """
     Stream a file in chunks to avoid loading the whole payload into RAM.
 
@@ -454,24 +455,30 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
             return {"success": False, "error": "Upload in progress"}
         parts = file_cursor.list_chunk_parts(file_id)
 
-    # The caller holds the same per-user lock as full and instant uploads.
-    # A retry replaces the previous part, so reserve only its size difference.
-    growth = len(decoded_chunk) - parts.get(chunk_index, 0)
-    error = None
-    if max_file_size >= 0 and sum(parts.values()) + growth > max_file_size:
-        error = "File too large"
-    elif storage_quota >= 0:
-        allocated = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
-        if allocated + growth > storage_quota:
-            error = "Storage quota exceeded"
-    if error:
-        if first_chunk:
+    guard = quota_guard if quota_guard is not None else nullcontext()
+    with guard:
+        growth = len(decoded_chunk) - parts.get(chunk_index, 0)
+        error = None
+        if max_file_size >= 0 and sum(parts.values()) + growth > max_file_size:
+            error = "File too large"
+        elif storage_quota >= 0:
+            allocated = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
+            if allocated + growth > storage_quota:
+                error = "Storage quota exceeded"
+        if error:
+            if first_chunk:
+                file_cursor.delete_chunk_task(file_id)
+            return {"success": False, "error": error}
+
+        try:
+            file_cursor.touch_chunk_task(file_id)
+            file_cursor.upsert_chunk_part(file_id, chunk_index, len(decoded_chunk))
+        except Exception:
             file_cursor.delete_chunk_task(file_id)
-        return {"success": False, "error": error}
+            _remove_chunk_files(port_api, file_id)
+            return {"success": False, "error": "Write failed"}
 
     try:
-        file_cursor.touch_chunk_task(file_id)
-        file_cursor.upsert_chunk_part(file_id, chunk_index, len(decoded_chunk))
         with open(_chunk_path(port_api, file_id, chunk_index), "wb") as f:
             f.write(decoded_chunk)
     except Exception:

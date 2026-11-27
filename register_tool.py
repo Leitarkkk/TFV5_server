@@ -59,7 +59,6 @@ def send_email(server, sender_email : str, receiver_email : str, subject : str, 
 def _captcha_expiry(stamp, entry):
     if isinstance(entry, dict):
         return entry["expires_at"]
-    # 升级前短时间内签发的图片验证码使用秒级时间戳。
     return int(stamp) + MAX_DELAY
 
 
@@ -76,7 +75,6 @@ def generate_captcha(port_api : int, Imgcaptcha, lock):
                         os.remove(os.path.join(folder, "{}.png".format(int(stamp))))
                     except FileNotFoundError:
                         pass
-            # JavaScript Number 也可以精确表示这个整数。
             stamp = secrets.randbits(52)
             while str(stamp) in records:
                 stamp = secrets.randbits(52)
@@ -111,20 +109,26 @@ def verify_captcha(port_api : int, time_stamp : int, verify_text : str, lock):
 
 
 def issue_email_code(port_api, email, activate_lock, *, uid, purpose):
-    code = secrets.randbelow(900000) + 100000
     now = time()
+    key = f"{purpose}:{uid}"
     with activate_lock:
         def issue(records):
-            # 旧格式不包含身份、用途或有效期，升级后需重新签发。
-            for key, entry in list(records.items()):
+            for k, entry in list(records.items()):
                 if not isinstance(entry, dict) or entry.get("expires_at", 0) <= now:
-                    del records[key]
-            records[f"{purpose}:{uid}"] = {
+                    del records[k]
+            previous = records.get(key)
+            if isinstance(previous, dict) and previous.get("email") == email:
+                code = previous["code"]
+                attempts_left = previous.get("attempts_left", EMAIL_CODE_ATTEMPTS)
+            else:
+                code = secrets.randbelow(900000) + 100000
+                attempts_left = EMAIL_CODE_ATTEMPTS
+            records[key] = {
                 "email": email, "code": code, "expires_at": now + EMAIL_CODE_TTL,
-                "attempts_left": EMAIL_CODE_ATTEMPTS,
+                "attempts_left": attempts_left,
             }
-        update_json("res/{}/activate.json".format(port_api), issue, default=dict)
-    return code
+            return code
+        return update_json("res/{}/activate.json".format(port_api), issue, default=dict)
 
 
 def send_email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, verify_code : int):
@@ -191,7 +195,7 @@ def verify_email(port_api, email, code, lock, *, uid, purpose):
         return False
     key = f"{purpose}:{uid}"
     with lock:
-        def consume(records):
+        def check(records):
             entry = records.get(key)
             if not isinstance(entry, dict) or entry["email"] != email:
                 return False
@@ -199,10 +203,20 @@ def verify_email(port_api, email, code, lock, *, uid, purpose):
                 del records[key]
                 return False
             if entry["code"] == code:
-                del records[key]
                 return True
             entry["attempts_left"] -= 1
             if entry["attempts_left"] <= 0:
                 del records[key]
             return False
-        return update_json("res/{}/activate.json".format(port_api), consume, default=dict)
+        return update_json("res/{}/activate.json".format(port_api), check, default=dict)
+
+
+def consume_email_code(port_api, email, code, lock, *, uid, purpose):
+    """状态变更成功后作废验证码"""
+    key = f"{purpose}:{uid}"
+    with lock:
+        def consume(records):
+            entry = records.get(key)
+            if isinstance(entry, dict) and entry.get("email") == email and entry.get("code") == code:
+                del records[key]
+        update_json("res/{}/activate.json".format(port_api), consume, default=dict)

@@ -2398,7 +2398,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not register_tool.verify_email(port_api, email, activate_code, locks['activate'],
                                           uid=uid, purpose="activate"):
             return bool_res()[False]
-        return bool_res()[user_cursor.activate_pending(uid, email)]
+        activated = bool_res()[user_cursor.activate_pending(uid, email)]
+        if activated:
+            register_tool.consume_email_code(port_api, email, activate_code, locks['activate'],
+                                             uid=uid, purpose="activate")
+        return activated
 
     @api("/auth/resend_activation", methods=["POST"])
     def resend_activation(req):
@@ -2469,6 +2473,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if not user_cursor.change_pwd(uid, new_pwd):
             return bool_res()[False]
+        register_tool.consume_email_code(port_api, email, code, locks['activate'],
+                                         uid=uid, purpose="reset")
         return bool_res()[run_critical_side_effect(
             "disconnect_user", lambda: instant_contact.disconnect_user(uid)
         )]
@@ -5088,20 +5094,20 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     return json.dumps({"success": False, "error": "Extension not allowed"}, ensure_ascii=False)
 
             limits = (cfg.get("user_storage_quota", -1), cfg.get("max_user_storage_quota", 73400320))
-            with quota_lock(uid):
-                result = file.chunked_upload_file(
-                    port_api,
-                    uid,
-                    normalized_name,
-                    chunk_index,
-                    chunk_total,
-                    chunk_data,
-                    file_id,
-                    file_cursor,
-                    expected_hash,
-                    max_file_size=read_upload_limit(cfg, "max_file_size"),
-                    storage_quota=min((limit for limit in limits if limit >= 0), default=-1),
-                )
+            result = file.chunked_upload_file(
+                port_api,
+                uid,
+                normalized_name,
+                chunk_index,
+                chunk_total,
+                chunk_data,
+                file_id,
+                file_cursor,
+                expected_hash,
+                max_file_size=read_upload_limit(cfg, "max_file_size"),
+                storage_quota=min((limit for limit in limits if limit >= 0), default=-1),
+                quota_guard=quota_lock(uid),
+            )
 
             if result.get("success") and result.get("file_hash"):
                 return json.dumps({
