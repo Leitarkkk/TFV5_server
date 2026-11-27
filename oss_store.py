@@ -7,14 +7,15 @@ OSS2 (阿里云对象存储) 适配模块。
   sticker/<hash>.file   （贴图文件）
 为 Object Key 存放在指定的 OSS2 Bucket 中。
 
-本地磁盘仅作为上传 / 下载的临时中转：上传时先存本地、再传 OSS、最后删本地；
-下载时先从 OSS 拉回本地临时文件（.oss_ 前缀）、发给客户端、再删除临时文件。
+HTTP 代理下载直接转发 OSS 字节流。上传和需要本地路径的媒体处理仍使用临时文件。
 """
 from __future__ import annotations
 
 import os
 import time
 import json
+import logging
+import mimetypes
 import threading
 import unicodedata
 import urllib.parse
@@ -241,8 +242,8 @@ def get_download_mode(port_api: int, cfg: dict = None) -> str:
     return mode
 
 
-def _content_disposition_value(filename: str):
-    """生成与 werkzeug send_file 完全一致的 attachment 头（含 RFC 5987 filename*）。"""
+def _content_disposition_value(filename: str, disposition="attachment"):
+    """生成下载响应头，支持 RFC 5987 文件名。"""
     try:
         from werkzeug.datastructures import Headers
         try:
@@ -253,10 +254,135 @@ def _content_disposition_value(filename: str):
             quoted = urllib.parse.quote(filename, safe="!#$&+-.^_`|~")
             names = {"filename": simple, "filename*": "UTF-8''" + quoted}
         headers = Headers()
-        headers.set("Content-Disposition", "attachment", **names)
+        headers.set("Content-Disposition", disposition, **names)
         return headers["Content-Disposition"]
     except Exception:
         return None
+
+
+def _proxy_range(request, info):
+    """解析一个字节区间，返回 OSS 使用的闭区间；If-Range 过期时发送完整对象。"""
+    from werkzeug.exceptions import RequestedRangeNotSatisfiable
+    from werkzeug.http import parse_date
+
+    validator = request.headers.get("If-Range")
+    if validator and validator != info.headers.get("ETag"):
+        date = parse_date(validator)
+        if date is None or date.timestamp() != info.last_modified:
+            return None
+
+    size = info.content_length
+    ranges = request.range
+    if not ranges or ranges.units != "bytes" or len(ranges.ranges) != 1 or not size:
+        raise RequestedRangeNotSatisfiable(size)
+    start, stop = ranges.ranges[0]
+    if request.headers["Range"].partition("=")[2].lstrip().startswith("-"):
+        if start == 0:
+            raise RequestedRangeNotSatisfiable(size)
+        start = max(0, size + start)
+    stop = min(stop, size) if stop is not None else size
+    if start >= stop:
+        raise RequestedRangeNotSatisfiable(size)
+    return start, stop - 1
+
+
+def _proxy_status(request, info):
+    modified = info.last_modified
+    if "If-Match" in request.headers:
+        if not request.if_match.contains(info.etag):
+            return 412
+    elif (request.if_unmodified_since and modified is not None
+          and modified > request.if_unmodified_since.timestamp()):
+        return 412
+    if "If-None-Match" in request.headers:
+        if request.if_none_match.contains_weak(info.etag):
+            return 304
+    elif (request.if_modified_since and modified is not None
+          and modified <= request.if_modified_since.timestamp()):
+        return 304
+    return 200
+
+
+def _proxy_body(raw):
+    # read1 可在收到首批字节时返回；早期 urllib3 只有 read，先取一个字节再按块读取。
+    read = getattr(raw, "read1", raw.read)
+    block_size = 64 * 1024
+    size = block_size if hasattr(raw, "read1") else 1
+    while chunk := read(size, decode_content=False):
+        yield chunk
+        size = block_size
+
+
+def proxy_download(port_api, kind, hashes, download_name, mimetype, *, as_attachment, max_age):
+    """通过内网 OSS 分块转发，普通 GET 直接打开对象，条件请求先读取元信息。"""
+    from flask import Response, request
+
+    bucket = _get_bucket(port_api)
+    key = object_key(kind, hashes)
+    headers = {"Accept-Encoding": "identity"}
+    head_first = request.method == "HEAD" or any(name in request.headers for name in (
+        "Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since",
+    ))
+    source = None
+    try:
+        if head_first:
+            info = bucket.head_object(key, headers=headers)
+        else:
+            source = info = bucket.get_object(key, headers=headers)
+
+        content_type = mimetype or mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        response = Response(mimetype=content_type)
+        response.content_length = info.content_length
+        response.accept_ranges = "bytes"
+        response.cache_control.public = True
+        response.cache_control.max_age = max_age
+        response.expires = int(time.time()) + max_age
+        disposition = "attachment" if as_attachment else "inline"
+        response.headers["Content-Disposition"] = _content_disposition_value(download_name, disposition) or disposition
+        if info.etag:
+            response.set_etag(info.etag)
+        if info.last_modified is not None:
+            response.last_modified = info.last_modified
+        if info.headers.get("Content-Encoding"):
+            response.headers["Content-Encoding"] = info.headers["Content-Encoding"]
+
+        if head_first:
+            response.status_code = _proxy_status(request, info)
+            if response.status_code == 412:
+                return Response(status=412)
+            if response.status_code != 200 or request.method == "HEAD":
+                return response
+            span = _proxy_range(request, info) if "Range" in request.headers else None
+            if info.etag:
+                headers["If-Match"] = info.headers["ETag"]
+            source = bucket.get_object(key, byte_range=span, headers=headers)
+            if span is not None:
+                start, end = span
+                response.status_code = 206
+                response.content_range = "bytes {}-{}/{}".format(start, end, info.content_length)
+                response.content_length = end - start + 1
+                if source.headers.get("Content-Range") != str(response.content_range):
+                    raise ValueError("OSS returned an unexpected Content-Range")
+        if source.status != response.status_code or source.content_length != response.content_length:
+            raise ValueError("OSS returned an unexpected status or Content-Length")
+
+        # OSS SDK 的 read() 会自动解压；直接转发存储的字节，确保长度和区间一致。
+        response.response = _proxy_body(source.resp.response.raw)
+        response.call_on_close(source.close)
+        response.headers["X-Accel-Buffering"] = "no"
+        source = None  # 交给 WSGI，在发送结束或客户端断开时释放。
+        return response
+    except oss2.exceptions.ServerError as exc:
+        if exc.status in (404, 412):
+            return "", exc.status
+        logging.getLogger(__name__).warning("OSS GET %s returned %s", key, exc.status)
+        return "", 502
+    except (oss2.exceptions.RequestError, ValueError) as exc:
+        logging.getLogger(__name__).warning("OSS proxy error for %s: %s", key, exc)
+        return "", 502
+    finally:
+        if source is not None:
+            source.close()
 
 
 def presigned_download_url(port_api: int, kind: str, hashes: str, filename: str = None,

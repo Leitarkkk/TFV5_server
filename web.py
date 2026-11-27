@@ -5356,27 +5356,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 )
                 if url:
                     return redirect(url, code=307)
-        # OSS2 模式（代理模式）
-        if oss_store.is_oss_enabled(port_api):
-            temp_path = oss_store.temp_download_path(port_api, "file", hashes)
-            try:
-                if not oss_store.download_from_oss(port_api, "file", hashes, temp_path):
-                    return ("", 404)
-                resp = send_file(
-                    temp_path,
-                    download_name=download_name,
-                    as_attachment=True,
-                    mimetype=mime_from_name(download_name),
-                    max_age=FILE_CACHE_MAX_AGE,
-                )
-                # 发送完成后立即删除本地临时文件
-                @resp.call_on_close
-                def _cleanup_temp():
-                    oss_store.safe_remove(temp_path)
-                return resp
-            except Exception:
-                oss_store.safe_remove(temp_path)
-                raise
+            return oss_store.proxy_download(
+                port_api, "file", hashes, download_name, mime_from_name(download_name),
+                as_attachment=True, max_age=FILE_CACHE_MAX_AGE,
+            )
         return send_file(
             "res/{}/file/{}.file".format(port_api, hashes),
             download_name=download_name,
@@ -5406,24 +5389,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     port_api, "thumb", hashes, download_name)
                 if url:
                     return redirect(url, code=307)
-            temp_path = oss_store.temp_download_path(port_api, "thumb", hashes)
-            try:
-                if not oss_store.download_from_oss(port_api, "thumb", hashes, temp_path):
-                    return ("", 404)
-                resp = send_file(
-                    temp_path,
-                    download_name=download_name,
-                    as_attachment=False,
-                    mimetype="image/webp",
-                    max_age=FILE_CACHE_MAX_AGE,
-                )
-                @resp.call_on_close
-                def _cleanup_thumb_temp():
-                    oss_store.safe_remove(temp_path)
-                return resp
-            except Exception:
-                oss_store.safe_remove(temp_path)
-                raise
+            return oss_store.proxy_download(
+                port_api, "thumb", hashes, download_name, "image/webp",
+                as_attachment=False, max_age=FILE_CACHE_MAX_AGE,
+            )
         target_path = file.thumb_path(port_api, hashes)
         if not os.path.isfile(target_path):
             return ("", 404)
@@ -5518,27 +5487,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 )
                 if url:
                     return redirect(url, code=307)
-        # OSS2 mode (proxy): download to unique temp file, delete immediately after sending
-        if oss_store.is_oss_enabled(port_api):
-            temp_path = oss_store.temp_download_path(port_api, "sticker", hashes)
-            try:
-                if not oss_store.download_from_oss(port_api, "sticker", hashes, temp_path):
-                    return ("", 404)
-                resp = send_file(
-                    temp_path,
-                    download_name=download_name,
-                    as_attachment=True,
-                    mimetype=mimetype_map.get(ext),
-                    # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
-                    max_age=FILE_CACHE_MAX_AGE,
-                )
-                @resp.call_on_close
-                def _cleanup_sticker_temp():
-                    oss_store.safe_remove(temp_path)
-                return resp
-            except Exception:
-                oss_store.safe_remove(temp_path)
-                raise
+            return oss_store.proxy_download(
+                port_api, "sticker", hashes, download_name, mimetype_map.get(ext),
+                as_attachment=True, max_age=FILE_CACHE_MAX_AGE,
+            )
         if not os.path.isfile(target_path):
             return ("", 404)
         return send_file(
