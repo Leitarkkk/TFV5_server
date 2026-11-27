@@ -6535,6 +6535,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 file_name=file_record["file_name"] if file_record else None,
                 forwarded=forwarded, duration=duration, mentioned_uids=mentioned_uids,
                 add_file_reference=file_cursor.add_reference if file_hash else None,
+                remove_file_reference=file_cursor.remove_reference if file_hash else None,
             )
 
             if msg_record.get("duplicate"):

@@ -227,13 +227,15 @@ class MessagesDb(Db):
                       quote: int = -1, group_id: int = None,
                        client_mid: str = None, file_name: str = None,
                         forwarded: int = -1, duration: int = None,
-                     mentioned_uids=(), add_file_reference=None) -> dict:
+                     mentioned_uids=(), add_file_reference=None,
+                     remove_file_reference=None) -> dict:
         send_time = time.time()
         mentioned_uids = {int(uid) for uid in mentioned_uids}
         _IntegrityError = self.dialect.IntegrityError
         with self.lock:
             def operation():
                 room_key = self.room_key_of(sender_uid, receiver_uid, group_id)
+                reference_added = False
                 try:
                     room_seq = self._allocate_room_sequences_locked(room_key)
                     mid = self._insert_message_locked(
@@ -253,12 +255,19 @@ class MessagesDb(Db):
                     self._advance_read_watermark_locked(
                         sender_uid, room_key, room_seq, mid, genuine=False)
                     # Attach the file before exposing the message in history or acknowledging it.
-                    if add_file_reference is not None and not add_file_reference(file_hash, "message", mid, sender_uid):
-                        raise FileReferenceUnavailable(file_hash)
+                    if add_file_reference is not None:
+                        if not add_file_reference(file_hash, "message", mid, sender_uid):
+                            raise FileReferenceUnavailable(file_hash)
+                        reference_added = True
                     self.conn.commit()
                     return mid, room_seq, False
                 except _IntegrityError:
                     self.conn.rollback()
+                    if reference_added and remove_file_reference is not None:
+                        try:
+                            remove_file_reference(file_hash, "message", mid)
+                        except Exception:
+                            pass
                     if client_mid is not None:
                         self.cursor.execute(
                             "SELECT mid FROM messages WHERE sender_uid = ? AND client_mid = ?",
@@ -268,6 +277,14 @@ class MessagesDb(Db):
                         self.conn.commit()
                         if existing:
                             return existing[0], None, True
+                    raise
+                except Exception:
+                    self.conn.rollback()
+                    if reference_added and remove_file_reference is not None:
+                        try:
+                            remove_file_reference(file_hash, "message", mid)
+                        except Exception:
+                            pass
                     raise
 
             mid, room_seq, duplicate = self._execute_with_retry(operation)

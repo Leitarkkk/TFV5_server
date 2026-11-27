@@ -250,9 +250,12 @@ class InstantConnect():
     def _touch_client_activity(self, websocket):
         """记录该连接最近一次上行帧时间（仅事件循环线程
         """
-        with self._clients_lock:
-            if websocket in self.clients_belonged:
-                self._client_last_inbound[websocket] = time.monotonic()
+        if websocket in self._client_last_inbound:
+            self._client_last_inbound[websocket] = time.monotonic()
+        else:
+            with self._clients_lock:
+                if websocket in self.clients_belonged:
+                    self._client_last_inbound[websocket] = time.monotonic()
 
     def _sweep_idle_connections(self):
         """关闭长时间没有任何上行数据的已登录连接
@@ -1409,6 +1412,7 @@ class InstantConnect():
                                 content_type='file', file_hash=file_hashes, quote=quote,
                                 client_mid=client_mid, file_name=metadata["file_name"],
                                 duration=duration, add_file_reference=self.file_cursor.add_reference,
+                                remove_file_reference=self.file_cursor.remove_reference,
                             )
                         except db.FileReferenceUnavailable:
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
@@ -1495,6 +1499,7 @@ class InstantConnect():
                                 content_type='file', file_hash=file_hashes, quote=quote, group_id=gid,
                                 client_mid=client_mid, file_name=metadata["file_name"],
                                 duration=duration, add_file_reference=self.file_cursor.add_reference,
+                                remove_file_reference=self.file_cursor.remove_reference,
                             )
                         except db.FileReferenceUnavailable:
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
