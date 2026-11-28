@@ -83,6 +83,19 @@ def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bo
     """搜索端点 不准你乱搜"""
     return check_rate_limit(uid, "search", max_per_window, window)
 
+# 配额检查 + 写入必须原子：否则两个并发上传都读到旧用量，双双通过。
+# 用按 uid 分条的锁，避免所有用户共用一个全局锁。
+_QUOTA_LOCK_STRIPES = 64
+_quota_locks = [threading.Lock() for _ in range(_QUOTA_LOCK_STRIPES)]
+
+
+def quota_lock(uid):
+    try:
+        index = int(uid) % _QUOTA_LOCK_STRIPES
+    except (TypeError, ValueError):
+        index = 0
+    return _quota_locks[index]
+
 # 单条 SQL 的占位符数量有上限（SQLite 默认 32766），公告又是按全量用户扇出的；
 # 不分批的话 `IN (...)` 直接抛错，异常被副作用包装吞掉 —— 一条通知都发不出去。
 NOTIFY_BATCH_SIZE = 500
@@ -359,7 +372,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
         return decorator
 
-    limiter = RateLimiter(port_api)
+    limiter = RateLimiter()
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "pending", "admin", "root"}
     # 受限状态：
@@ -5034,7 +5047,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         quota = cfg.get("user_storage_quota", -1)
         max_quota = cfg.get("max_user_storage_quota", 73400320)  # 默认 70MB
         new_hashes = file.sha256(payload)
-        with file.quota_lock(port_api, uid):
+        with quota_lock(uid):
             if quota != -1 or max_quota != -1:
                 if not file_cursor.has_active_user_file(uid, new_hashes):
                     new_size = len(payload)

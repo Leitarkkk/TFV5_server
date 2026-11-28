@@ -468,10 +468,6 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
         file_id = sha256("{}{}{}".format(time.time(), uid, uuid.uuid4().hex))
     elif not isinstance(file_id, str) or not file_id:
         return {"success": False, "error": "Missing file_id"}
-    elif chunk_index == 0 and (
-        len(file_id) != 64 or any(c not in "0123456789abcdef" for c in file_id)
-    ):
-        return {"success": False, "error": "Invalid file_id"}
 
     with _chunk_lock(port_api, file_id):
         try:
@@ -509,8 +505,11 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
     guard = quota_guard if quota_guard is not None else nullcontext()
     with guard:
         growth = len(decoded_chunk) - parts.get(chunk_index, 0)
+        total_after_write = sum(parts.values()) + growth
         error = None
-        if max_file_size >= 0 and sum(parts.values()) + growth > max_file_size:
+        if total_after_write > MAX_TOTAL_SIZE:
+            error = "File too large"
+        elif max_file_size >= 0 and total_after_write > max_file_size:
             error = "File too large"
         elif storage_quota >= 0:
             allocated = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
@@ -538,15 +537,12 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
         return {"success": False, "error": "Write failed"}
 
     if chunk_index == chunk_total - 1:
-        return _finalize_chunked_upload(port_api, uid, file_name, file_id, chunk_total, expected_hash, file_cursor)
+        return _finalize_chunked_upload(
+            port_api, uid, file_name, file_id, chunk_total, expected_hash,
+            file_cursor, None,
+        )
 
-        if chunk_index == chunk_total - 1:
-            return _finalize_chunked_upload(
-                port_api, uid, file_name, file_id, chunk_total, expected_hash,
-                file_cursor, validate_upload,
-            )
-
-        return {"success": True, "file_id": file_id}
+    return {"success": True, "file_id": file_id}
 
 
 def _chunk_path(port_api : int, file_id : str, chunk_index : int):
